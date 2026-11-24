@@ -210,3 +210,114 @@ func TestWithDelegatesRefusesAPathologicalTree(t *testing.T) {
 		t.Errorf("error %q does not match ErrDecodeLimit", err)
 	}
 }
+
+// FuzzDecodeAuthorizationEntry feeds arbitrary bytes through the bounded
+// decoder. Anything must either decode or fail with a clean error, never a
+// panic, and whatever the decoder consumed must re-encode identically without
+// growing: the XDR decoder reads a prefix of its input and ignores trailing
+// bytes, so a byte-identical round-trip holds only for the consumed prefix.
+// An input past the size bound must refuse with ErrDecodeLimit rather than
+// decoding at all.
+func FuzzDecodeAuthorizationEntry(f *testing.F) {
+	// f is passed to the helper directly, which takes testing.TB. A
+	// &testing.T{} literal would be an uninitialised struct: Helper() and
+	// Fatalf() on one panic rather than reporting, so a seed that failed to
+	// build would take the target down instead of failing it.
+	seed := entryForArm(f, xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2, 42)
+	if raw, err := seed.MarshalBinary(); err == nil {
+		f.Add(raw)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		encoded := base64.StdEncoding.EncodeToString(data)
+		entry, err := DecodeAuthorizationEntry(encoded)
+		if err != nil {
+			if len(data) > MaxDecodeInputBytes && !errors.Is(err, ErrDecodeLimit) {
+				t.Errorf("oversized input (%d bytes) refused without ErrDecodeLimit: %v", len(data), err)
+			}
+			return
+		}
+		roundTrip, err := entry.MarshalBinary()
+		if err != nil {
+			t.Fatalf("DecodeAuthorizationEntry returned an entry that does not re-encode: %v", err)
+		}
+		if len(roundTrip) > len(data) {
+			t.Errorf("re-encoding grew %d input bytes into %d", len(data), len(roundTrip))
+		} else if !bytes.Equal(roundTrip, data[:len(roundTrip)]) {
+			t.Errorf("re-encoding changed the %d consumed bytes of %d input bytes", len(roundTrip), len(data))
+		}
+	})
+}
+
+// TestDecodeTransactionEnvelopeReadsAValidEnvelope proves the bound is above a
+// real Soroban transaction and that the decoder changes nothing: re-encoding
+// the decoded envelope reproduces the input bytes.
+func TestDecodeTransactionEnvelopeReadsAValidEnvelope(t *testing.T) {
+	envelope, err := xdr.MarshalBase64(transactionEnvelope(t,
+		invokeOperation(t, entryForArm(t, xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2, 7))))
+	if err != nil {
+		t.Fatalf("encoding the test envelope: %v", err)
+	}
+	want, err := base64.StdEncoding.DecodeString(envelope)
+	if err != nil {
+		t.Fatalf("decoding the test envelope: %v", err)
+	}
+
+	got, err := DecodeTransactionEnvelope(envelope)
+	if err != nil {
+		t.Fatalf("DecodeTransactionEnvelope returned an unexpected error: %v", err)
+	}
+	roundTrip, err := got.MarshalBinary()
+	if err != nil {
+		t.Fatalf("re-marshalling the decoded envelope: %v", err)
+	}
+	if !bytes.Equal(roundTrip, want) {
+		t.Errorf("re-encoded envelope differs from the input\n want %x\n  got %x", want, roundTrip)
+	}
+}
+
+// TestDecodeTransactionEnvelopeRejectsEmptyInput keeps the empty case an error
+// rather than a silently zero-valued envelope.
+func TestDecodeTransactionEnvelopeRejectsEmptyInput(t *testing.T) {
+	if _, err := DecodeTransactionEnvelope(""); err == nil {
+		t.Fatal("decoding an empty input succeeded")
+	}
+}
+
+// TestDecodeTransactionEnvelopeRejectsOversizedInput proves the length check
+// runs before any base64 or XDR work: the input is not valid base64 at all,
+// yet it is refused as a limit rather than as malformed input.
+func TestDecodeTransactionEnvelopeRejectsOversizedInput(t *testing.T) {
+	oversized := strings.Repeat("A", base64.StdEncoding.EncodedLen(MaxDecodeInputBytes)+4)
+
+	_, err := DecodeTransactionEnvelope(oversized)
+	if err == nil {
+		t.Fatalf("decoding a %d-byte input succeeded", len(oversized))
+	}
+	if !errors.Is(err, ErrDecodeLimit) {
+		t.Errorf("error %q does not match ErrDecodeLimit", err)
+	}
+}
+
+// TestDecodeTransactionEnvelopeRejectsPathologicalDepth is the envelope half of
+// the depth guard: an envelope whose operation carries a deeply nested
+// invocation tree must be refused rather than fully decoded, even though the
+// SDK's default of 1500 levels would accept it.
+func TestDecodeTransactionEnvelopeRejectsPathologicalDepth(t *testing.T) {
+	deep := xdr.SorobanAuthorizationEntry{
+		Credentials:    xdr.SorobanCredentials{Type: xdr.SorobanCredentialsTypeSorobanCredentialsSourceAccount},
+		RootInvocation: nestedInvocation(t, MaxDecodeDepth*4),
+	}
+	envelope, err := xdr.MarshalBase64(transactionEnvelope(t, invokeOperation(t, deep)))
+	if err != nil {
+		t.Fatalf("encoding the pathological envelope: %v", err)
+	}
+
+	got, err := DecodeTransactionEnvelope(envelope)
+	if err == nil {
+		t.Fatalf("decoding a %d-level envelope succeeded, returning %+v", MaxDecodeDepth*4, got)
+	}
+	if !errors.Is(err, ErrDecodeLimit) {
+		t.Errorf("error %q does not match ErrDecodeLimit", err)
+	}
+}

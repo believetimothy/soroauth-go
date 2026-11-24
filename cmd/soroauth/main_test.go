@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -20,6 +24,7 @@ type vectorFile struct {
 	ValidUntilLedger  uint32 `json:"valid_until_ledger"`
 	PreWrapEntryXDR   string `json:"pre_wrap_entry_xdr"`
 	UnsignedEntryXDR  string `json:"unsigned_entry_xdr"`
+	SignedEntryXDR    string `json:"signed_entry_xdr"`
 	PreimageXDR       string `json:"preimage_xdr"`
 	PayloadHex        string `json:"payload_hex"`
 	Delegates         []struct {
@@ -61,7 +66,7 @@ func runCLIEnv(t *testing.T, env map[string]string, args ...string) (stdout, std
 func TestRunWithoutACommand(t *testing.T) {
 	stdout, stderr, err := runCLI(t)
 	if err == nil {
-		t.Fatal("running with no command succeeded")
+		t.Fatalf("running with no command succeeded")
 	}
 	if stdout != "" {
 		t.Errorf("usage went to stdout: %q", stdout)
@@ -94,6 +99,72 @@ func TestRunHelp(t *testing.T) {
 	}
 }
 
+func TestSubcommandErrorsNeverPrintEnvironmentSecret(t *testing.T) {
+	if len(cliSubcommands) == 0 {
+		t.Fatal("no CLI subcommands registered; secret-leak coverage would pass vacuously")
+	}
+	secret := vectorKeypair(t, "soroauth-issue-447-distinctive-secret").Seed()
+	env := map[string]string{"SOROAUTH_TEST_SECRET": secret}
+	names := make([]string, 0, len(cliSubcommands))
+	for name := range cliSubcommands {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	assertSecretAbsent := func(t *testing.T, stdout, stderr string, err error) {
+		t.Helper()
+		for label, output := range map[string]string{
+			"stdout": stdout,
+			"stderr": stderr,
+			"error":  errorText(err),
+		} {
+			if strings.Contains(output, secret) {
+				t.Errorf("%s leaked the test seed", label)
+			}
+		}
+	}
+
+	t.Run("usage errors across dispatcher", func(t *testing.T) {
+		for _, name := range names {
+			t.Run(name, func(t *testing.T) {
+				stdout, stderr, err := runCLIEnv(t, env, name, "--soroauth-test-unknown-flag")
+				if err == nil {
+					t.Fatal("invalid flag unexpectedly succeeded")
+				}
+				assertSecretAbsent(t, stdout, stderr, err)
+			})
+		}
+	})
+
+	t.Run("sign decode error", func(t *testing.T) {
+		stdout, stderr, err := runCLIEnv(t, map[string]string{"SEED": secret},
+			"sign", "--entry", "not-base64", "--valid-until", "1234567",
+			"--network", "testnet", "--secret-env", "SEED")
+		if err == nil {
+			t.Fatal("malformed entry unexpectedly succeeded")
+		}
+		assertSecretAbsent(t, stdout, stderr, err)
+	})
+
+	t.Run("signing refusal", func(t *testing.T) {
+		v := loadVector(t, "v2_single_testnet")
+		stdout, stderr, err := runCLIEnv(t, map[string]string{"SEED": secret},
+			"sign", "--entry", v.UnsignedEntryXDR, "--valid-until", "1234567",
+			"--network", "testnet", "--secret-env", "SEED")
+		if err == nil {
+			t.Fatal("signing with a non-matching signer unexpectedly succeeded")
+		}
+		assertSecretAbsent(t, stdout, stderr, err)
+	})
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 // TestDecodeEntryRejectsOversizedInput proves the CLI uses the library's
 // bounded decoder rather than the SDK's unbounded-length helper, and that it
 // refuses before doing any base64 work (the input is not valid base64).
@@ -122,7 +193,7 @@ func TestResolveNetwork(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveNetwork(tt.value)
+			got, err := resolveNetwork(context.Background(), tt.value, "", io.Discard, func(string) string { return "" }, func(context.Context, string) (string, error) { return "", fmt.Errorf("not called") })
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("resolveNetwork(%q) succeeded, returning %q", tt.value, got)
@@ -184,6 +255,94 @@ func TestPayloadJSONOutput(t *testing.T) {
 	}
 	if out.Payload != v.PayloadHex {
 		t.Errorf("payload mismatch: want %s, got %s", v.PayloadHex, out.Payload)
+	}
+}
+
+func TestStdoutResultsOnlyOnFailurePaths(t *testing.T) {
+	// Test explicitly that stdout stays completely clean/empty on various failure paths.
+	// Invalid entry argument:
+	stdout, stderr, err := runCLI(t, "payload", "--entry", "invalid-base64", "--valid-until", "1234567", "--network", "testnet")
+	if err == nil {
+		t.Fatal("expected error for invalid base64 entry")
+	}
+	if stdout != "" {
+		t.Errorf("stdout expected to be empty on failure, got %q", stdout)
+	}
+	// The diagnostic is the returned error, not something written to stderr.
+	// run returns it and main() is what prints it, so a test driving run sees
+	// an empty stderr on every path the flag package did not write to itself.
+	_ = stderr
+	if err.Error() == "" {
+		t.Error("expected a non-empty error from the failure path")
+	}
+
+	// Ensure that stdout stays strictly empty/results-only on all error paths (non-json mode writes errors to stderr and nothing to stdout).
+	for _, subcmd := range [][]string{
+		{"payload", "--entry", "not-base64", "--valid-until", "1", "--network", "testnet"},
+		{"sign", "--entry", "not-base64", "--valid-until", "1", "--network", "testnet", "--secret-env", "SEED"},
+		{"delegates", "--entry", "not-base64", "--valid-until", "1", "--delegate", "GABC..."},
+		{"inspect", "--entry", "not-base64"},
+	} {
+		stdout, _, err := runCLI(t, subcmd...)
+		if err == nil {
+			t.Fatalf("cmd %v expected failure", subcmd)
+		}
+		if stdout != "" {
+			t.Errorf("cmd %v produced stdout on failure: %q", subcmd, stdout)
+		}
+		if err.Error() == "" {
+			t.Errorf("cmd %v failed with an empty error message", subcmd)
+		}
+	}
+
+	// Also test JSON failure output paths to ensure stdout only carries JSON error object and not usage text or trailing junk
+	stdout, _, err = runCLI(t, "payload", "--entry", "not-base64", "--valid-until", "1", "--network", "testnet", "--json")
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	var jsonErr struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &jsonErr); err != nil {
+		t.Fatalf("stdout is not valid JSON error object: %q (%v)", stdout, err)
+	}
+	if jsonErr.Error == "" {
+		t.Error("json error object missing error field")
+	}
+}
+
+func TestPipelineStdoutResultsOnlyOnFailure(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := runWithStdin([]string{"payload", "--entry", "-", "--valid-until", "1", "--network", "testnet"}, &stdout, &stderr, os.Getenv, strings.NewReader("invalid-input"))
+	if err == nil {
+		t.Fatal("expected failure for invalid stdin")
+	}
+	filesStdout := stdout.String()
+	if filesStdout != "" {
+		t.Errorf("expected empty stdout on pipeline failure, got %q", filesStdout)
+	}
+}
+
+func TestPipelineFailureStdoutResultsOnly(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := runWithStdin([]string{"payload", "--entry", "-", "--valid-until", "1", "--network", "testnet"}, &stdout, &stderr, os.Getenv, strings.NewReader("bad-input"))
+	if err == nil {
+		t.Fatal("expected failure for bad stdin")
+	}
+	if stdout.String() != "" {
+		t.Errorf("expected empty stdout on pipeline failure, got %q", stdout.String())
+	}
+}
+
+func TestPipelineFailureOutputsCleanStdout(t *testing.T) {
+	stdinReader := strings.NewReader("invalid-stdin-entry")
+	var stdout, stderr bytes.Buffer
+	err := runWithStdin([]string{"payload", "--entry", "-", "--valid-until", "1", "--network", "testnet"}, &stdout, &stderr, os.Getenv, stdinReader)
+	if err == nil {
+		t.Fatal("expected pipeline failure with invalid stdin")
+	}
+	if stdout.String() != "" {
+		t.Errorf("expected empty stdout on pipeline failure, got %q", stdout.String())
 	}
 }
 
@@ -420,7 +579,7 @@ func TestExitCodes(t *testing.T) {
 			name:     "inspect no entry",
 			args:     []string{"inspect"},
 			wantCode: ExitUsageError,
-			wantMsg:  "--entry is required",
+			wantMsg:  "--entry or --entries is required",
 		},
 		{
 			name:     "inspect malformed entry",
@@ -473,7 +632,7 @@ func TestExitCodes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			stdout, stderr, err := runCLIEnv(t, tt.env, tt.args...)
+			stdout, _, err := runCLIEnv(t, tt.env, tt.args...)
 			if err == nil {
 				t.Fatalf("expected error, got success: stdout=%q", stdout)
 			}
@@ -486,10 +645,6 @@ func TestExitCodes(t *testing.T) {
 			// In non-JSON mode, stdout should be empty on error
 			if stdout != "" && !strings.Contains(strings.Join(tt.args, " "), "--json") {
 				t.Errorf("a failing command wrote to stdout: %q", stdout)
-			}
-			// stderr should contain usage text for usage errors
-			if tt.wantCode == ExitUsageError && !strings.Contains(stderr, "usage:") && !strings.Contains(tt.name, "unknown command") && !strings.Contains(tt.name, "no command") {
-				// Some usage errors don't print usage (like flag parsing errors)
 			}
 		})
 	}
@@ -561,6 +716,63 @@ func TestExitCodesJSONMode(t *testing.T) {
 }
 
 // TestExitCodeSuccess verifies that successful commands exit with code 0.
+func TestPipelineFailureOutputsCleanStdoutLegacy(t *testing.T) {
+	var out, errOut bytes.Buffer
+	// Simulate piping invalid data via stdin or triggering a failure path
+	stdin := strings.NewReader("not-valid-base64\n")
+	err := runWithStdin([]string{"payload", "--entry", "-", "--network", "testnet"}, &out, &errOut, func(string) string { return "" }, stdin)
+	if err == nil {
+		t.Fatal("expected error on invalid pipeline input, got nil")
+	}
+	if out.String() != "" {
+		t.Errorf("expected stdout to stay empty on failure path, got %q", out.String())
+	}
+}
+
+func TestPipelineCompositionWithStdin(t *testing.T) {
+	v := loadVector(t, "delegates_from_legacy")
+	signer := vectorKeypair(t, "soroauth-vector-signer-1")
+
+	// Pipeline: soroauth delegates ... | soroauth sign --entry -
+	// Simulate stdin with delegates output
+	delegatesStdout, _, err := runCLI(t, "delegates",
+		"--entry", v.PreWrapEntryXDR,
+		"--valid-until", "1234567",
+		"--delegate", v.Delegates[0].Address)
+	if err != nil {
+		t.Fatalf("delegates failed: %v", err)
+	}
+
+	var signErr error
+	signOut, signErr := runCLIEnvStdin(t, map[string]string{"SEED": signer.Seed()}, delegatesStdout,
+		"sign",
+		"--entry", "-",
+		"--valid-until", "1234567",
+		"--network", "testnet",
+		"--secret-env", "SEED",
+		"--for", v.Delegates[0].Address)
+	if signErr != nil {
+		t.Fatalf("sign from stdin pipeline failed: %v", signErr)
+	}
+
+	var entry xdr.SorobanAuthorizationEntry
+	if err := xdr.SafeUnmarshalBase64(strings.TrimSpace(signOut), &entry); err != nil {
+		t.Fatalf("decoding entry from pipeline: %v", err)
+	}
+	if entry.Credentials.Type != xdr.SorobanCredentialsTypeSorobanCredentialsAddressWithDelegates {
+		t.Errorf("credential type is %v, want delegates arm", entry.Credentials.Type)
+	}
+}
+
+// runCLIEnvStdin drives the dispatcher with a fake environment and custom stdin reader.
+func runCLIEnvStdin(t *testing.T, env map[string]string, stdinContent string, args ...string) (stdout string, err error) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	stdinReader := strings.NewReader(stdinContent)
+	err = runWithStdin(args, &out, &errOut, func(key string) string { return env[key] }, stdinReader)
+	return out.String(), err
+}
+
 func TestExitCodeSuccess(t *testing.T) {
 	v := loadVector(t, "v2_single_testnet")
 	signer := vectorKeypair(t, "soroauth-vector-signer-1")
@@ -754,5 +966,113 @@ func TestCrossCompileNoTargets(t *testing.T) {
 	}
 	if out.Error == "" {
 		t.Error("JSON error object has empty error field")
+	}
+}
+
+// TestExplainError tests the explain-error subcommand with various credential types.
+func TestExplainError(t *testing.T) {
+	tests := []struct {
+		name      string
+		vector    string
+		wantError bool
+	}{
+		{
+			name:      "v2_single_testnet",
+			vector:    "v2_single_testnet",
+			wantError: false,
+		},
+		{
+			name:      "legacy_single_testnet",
+			vector:    "legacy_single_testnet",
+			wantError: false,
+		},
+		{
+			name:      "source_account_testnet",
+			vector:    "source_account_testnet",
+			wantError: false,
+		},
+		{
+			name:      "v2_sub_invocations",
+			vector:    "v2_sub_invocations",
+			wantError: false,
+		},
+		{
+			name:      "delegates_unsorted_with_nested",
+			vector:    "delegates_unsorted_with_nested",
+			wantError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := loadVector(t, tt.vector)
+			_, stderr, err := runCLI(t, "explain-error", "--entry", v.UnsignedEntryXDR)
+			if err != nil && !tt.wantError {
+				t.Fatalf("explain-error failed: %v\nstderr: %q", err, stderr)
+			}
+			if !tt.wantError {
+				out, _, _ := runCLI(t, "explain-error", "--entry", v.UnsignedEntryXDR)
+				if out == "" {
+					t.Error("expected non-empty stdout from explain-error")
+				} else {
+					// Verify the output contains expected content
+					if !strings.Contains(out, "Credential type:") {
+						t.Errorf("stdout should contain 'Credential type:', got: %q", out)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestExplainErrorJSON tests the explain-error --json flag.
+func TestExplainErrorJSON(t *testing.T) {
+	t.Run("v2_single_testnet", func(t *testing.T) {
+		v := loadVector(t, "v2_single_testnet")
+		stdout, _, err := runCLI(t, "explain-error", "--entry", v.UnsignedEntryXDR, "--json")
+		if err != nil {
+			t.Fatalf("explain-error --json failed: %v", err)
+		}
+		var result struct {
+			Entry     string `json:"entry,omitempty"`
+			PlainText string `json:"plain_text"`
+			JSON      string `json:"json,omitempty"`
+			Error     string `json:"error,omitempty"`
+			ErrorExit int    `json:"-"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatalf("stdout is not valid JSON: %v\nstdout: %q", err, stdout)
+		}
+		if result.Entry == "" {
+			t.Error("expected entry in JSON output")
+		}
+		if result.PlainText == "" {
+			t.Error("expected plain text in JSON output")
+		}
+	})
+}
+
+// TestExplainErrorMissingEntry tests that --entry is required.
+func TestExplainErrorMissingEntry(t *testing.T) {
+	_, _, err := runCLI(t, "explain-error")
+	if err == nil {
+		t.Fatal("expected error when no --entry given")
+	}
+	if ExitCode(err) != ExitUsageError {
+		t.Errorf("exit code %d, want %d", ExitCode(err), ExitUsageError)
+	}
+	if !strings.Contains(err.Error(), "--entry is required") {
+		t.Errorf("error should mention '--entry is required', got: %q", err.Error())
+	}
+}
+
+// TestExplainErrorUnknownCommand tests that unknown commands are rejected.
+func TestExplainErrorUnknownCommand(t *testing.T) {
+	_, _, err := runCLI(t, "explain-error", "frobnicate")
+	if err == nil {
+		t.Fatal("expected error for unknown subcommand after explain-error")
+	}
+	if ExitCode(err) != ExitUsageError {
+		t.Errorf("exit code %d, want %d", ExitCode(err), ExitUsageError)
 	}
 }

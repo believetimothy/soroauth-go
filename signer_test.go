@@ -3,11 +3,14 @@ package soroauth
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -121,7 +124,7 @@ func TestEd25519SignerProducesTheAccountSignatureShape(t *testing.T) {
 
 	// The value goes into a credential node, so it must be legal XDR.
 	if _, err := value.MarshalBinary(); err != nil {
-		t.Fatalf("signature does not marshal: %v", err)
+		t.Fatalf("marshaling signature ScVal failed: %v", err)
 	}
 
 	parts := decodeAccountSignature(t, value)
@@ -182,9 +185,20 @@ func TestSignersHonourContextCancellation(t *testing.T) {
 		t.Fatalf("building the multi signer: %v", err)
 	}
 
+	passkeyAuthData := make([]byte, 37)
+	passkeyAuthData[32] = 0x01
+	passkeySigner := NewPasskeySigner(kp.Address(), passkeyAuthData, func(ctx context.Context, _ xdr.HashIdPreimage, _ [32]byte) (xdr.ScVal, error) {
+		if err := ctx.Err(); err != nil {
+			return xdr.ScVal{}, err
+		}
+		return scBytes([]byte("sig")),
+			nil
+	}, RequireUserPresence(true))
+
 	signers := map[string]Signer{
 		"ed25519":  NewEd25519Signer(kp),
 		"multisig": multi,
+		"passkey":  passkeySigner,
 		"func": SignerFunc(kp.Address(), func(context.Context, xdr.HashIdPreimage, [32]byte) (xdr.ScVal, error) {
 			t.Error("the callback ran despite a cancelled context")
 			return xdr.ScVal{}, nil
@@ -200,6 +214,44 @@ func TestSignersHonourContextCancellation(t *testing.T) {
 				t.Errorf("error %v does not match context.Canceled", err)
 			}
 		})
+	}
+}
+
+func TestSignerContextCancellationIntegration(t *testing.T) {
+	importNetListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("skipping TCP integration test: %v", err)
+	}
+	defer importNetListener.Close()
+
+	go func() {
+		for {
+			conn, err := importNetListener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	addr := importNetListener.Addr().String()
+	signer := SignerFunc("G...", func(ctx context.Context, _ xdr.HashIdPreimage, _ [32]byte) (xdr.ScVal, error) {
+		d := &net.Dialer{}
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return xdr.ScVal{}, err
+		}
+		defer conn.Close()
+		return scBytes([]byte("ok")),
+			nil
+	})
+
+	_, err = signer.Sign(ctx, xdr.HashIdPreimage{}, testPayload("integration"))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled from cancelled TCP integration signer, got %v", err)
 	}
 }
 
@@ -425,6 +477,159 @@ func TestSignerFuncPropagatesErrors(t *testing.T) {
 	}
 }
 
+func TestSignerRetryPolicy(t *testing.T) {
+	// Test successful recovery after transient transport errors
+	address := testContractAddress(t, "soroauth-retry-contract")
+	var attempts int
+	transportErr := errors.New("connection reset by peer")
+
+	signer := WithRetry(SignerFunc(address, func(_ context.Context, _ xdr.HashIdPreimage, _ [32]byte) (xdr.ScVal, error) {
+		attempts++
+		if attempts < 3 {
+			return xdr.ScVal{}, transportErr
+		}
+		return scBytes([]byte("success")), nil
+	}), RetryConfig{
+		Attempts:       3,
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     10 * time.Millisecond,
+	})
+
+	val, err := signer.Sign(context.Background(), xdr.HashIdPreimage{}, testPayload("x"))
+	if err != nil {
+		t.Fatalf("Sign returned unexpected error: %v", err)
+	}
+	if attempts != 3 {
+		t.Errorf("attempts = %d, want 3", attempts)
+	}
+	if val.Type == xdr.ScValTypeScvVoid {
+		t.Error("returned ScVal is empty")
+	}
+
+	// Test that signature rejections are NEVER retried
+	var rejectionAttempts int
+	rejectionErr := fmt.Errorf("%w: bad sig", ErrSignatureMismatch)
+	rejectionSigner := WithRetry(SignerFunc(address, func(_ context.Context, _ xdr.HashIdPreimage, _ [32]byte) (xdr.ScVal, error) {
+		rejectionAttempts++
+		return xdr.ScVal{}, rejectionErr
+	}), RetryConfig{
+		Attempts:       5,
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     10 * time.Millisecond,
+	})
+
+	_, err = rejectionSigner.Sign(context.Background(), xdr.HashIdPreimage{}, testPayload("x"))
+	if !errors.Is(err, ErrSignatureMismatch) {
+		t.Errorf("error %v does not wrap ErrSignatureMismatch", err)
+	}
+	if rejectionAttempts != 1 {
+		t.Errorf("rejectionAttempts = %d, want 1; signature rejection must not be retried", rejectionAttempts)
+	}
+
+	// Test context cancellation wins over pending retry
+	cancelAttempts := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelSigner := WithRetry(SignerFunc(address, func(_ context.Context, _ xdr.HashIdPreimage, _ [32]byte) (xdr.ScVal, error) {
+		cancelAttempts++
+		cancel()
+		return xdr.ScVal{}, transportErr
+	}), RetryConfig{
+		Attempts:       5,
+		InitialBackoff: 50 * time.Millisecond,
+		MaxBackoff:     200 * time.Millisecond,
+	})
+
+	_, err = cancelSigner.Sign(ctx, xdr.HashIdPreimage{}, testPayload("x"))
+	if err == nil {
+		t.Fatal("Sign succeeded despite context cancellation")
+	}
+	if cancelAttempts != 1 {
+		t.Errorf("cancelAttempts = %d, want 1; should stop after context cancellation", cancelAttempts)
+	}
+}
+
+// TestIsSignatureRejection locks in the line between an error a retry could
+// clear and one it cannot. The distinction is the whole point of WithRetry:
+// "connection refused" is a transport fault worth retrying, while a refusal
+// the signer actually produced is not.
+func TestIsSignatureRejection(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"signature mismatch", fmt.Errorf("wrap: %w", ErrSignatureMismatch), true},
+		{"missing signer", fmt.Errorf("wrap: %w", ErrMissingSigner), true},
+		{"too many signatures", fmt.Errorf("wrap: %w", ErrTooManySignatures), true},
+		{"connection refused", errors.New("remote: sign: dial tcp: connection refused"), false},
+		{"connection reset", errors.New("remote: sign: connection reset by peer"), false},
+		{"remote server refusal", errors.New("remote: sign: server refused: signer refused: bad credentials"), true},
+		{"unsupported", errors.New("some unsupported operation"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsSignatureRejection(tt.err); got != tt.want {
+				t.Errorf("IsSignatureRejection(%v) = %t, want %t", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWithRetryRetriesConnectionRefused is the regression the e2e suite caught:
+// a "connection refused" transport error was classified as a rejection and
+// never retried, so a transient network fault failed the run outright.
+func TestWithRetryRetriesConnectionRefused(t *testing.T) {
+	address := testContractAddress(t, "soroauth-refused-contract")
+	var attempts int
+	signer := WithRetry(SignerFunc(address, func(_ context.Context, _ xdr.HashIdPreimage, _ [32]byte) (xdr.ScVal, error) {
+		attempts++
+		if attempts < 3 {
+			return xdr.ScVal{}, errors.New("dial tcp 127.0.0.1:8000: connect: connection refused")
+		}
+		return scBytes([]byte("ok")), nil
+	}), RetryConfig{
+		Attempts:       3,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     10 * time.Millisecond,
+	})
+
+	if _, err := signer.Sign(context.Background(), xdr.HashIdPreimage{}, testPayload("x")); err != nil {
+		t.Fatalf("Sign returned an unexpected error: %v", err)
+	}
+	if attempts != 3 {
+		t.Errorf("attempts = %d, want 3; a connection-refused transport error must be retried", attempts)
+	}
+}
+
+func TestSignerRetryIntegration(t *testing.T) {
+	var attempts int
+	retrySigner := WithRetry(SignerFunc("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", func(ctx context.Context, preimage xdr.HashIdPreimage, payload [32]byte) (xdr.ScVal, error) {
+		attempts++
+		if attempts < 3 {
+			return xdr.ScVal{}, errors.New("transient")
+		}
+		return scBytes([]byte("ok")),
+			nil
+	}), RetryConfig{
+		Attempts:       3,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     10 * time.Millisecond,
+	})
+
+	val, err := retrySigner.Sign(context.Background(), xdr.HashIdPreimage{}, testPayload("x"))
+	if err != nil {
+		t.Fatalf("Sign unexpected error: %v", err)
+	}
+	if attempts != 3 {
+		t.Errorf("attempts = %d, want 3", attempts)
+	}
+	if val.Type == xdr.ScValTypeScvVoid {
+		t.Error("returned ScVal is empty")
+	}
+}
+
 func TestSignerFuncWithoutACallback(t *testing.T) {
 	got, err := SignerFunc("G...", nil).Sign(context.Background(), xdr.HashIdPreimage{}, testPayload("x"))
 	if err == nil {
@@ -528,4 +733,101 @@ func TestPasskeySignerFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEd25519SignatureScVal proves the exported builder produces byte-identical
+// output to NewEd25519Signer for the same key and payload, so an external
+// signer adapter can use it without the shape drifting from the in-process one.
+func TestEd25519SignatureScVal(t *testing.T) {
+	kp := testKeypair(t, "soroauth-scval-builder")
+	raw, err := rawEd25519Key(kp.Address())
+	if err != nil {
+		t.Fatalf("rawEd25519Key: %v", err)
+	}
+	payload := testPayload("scval")
+	signature, err := kp.Sign(payload[:])
+	if err != nil {
+		t.Fatalf("signing: %v", err)
+	}
+
+	got, err := Ed25519SignatureScVal(raw, signature)
+	if err != nil {
+		t.Fatalf("Ed25519SignatureScVal: %v", err)
+	}
+
+	want, err := NewEd25519Signer(kp).Sign(context.Background(), xdr.HashIdPreimage{}, payload)
+	if err != nil {
+		t.Fatalf("NewEd25519Signer.Sign: %v", err)
+	}
+	gotBytes, err := got.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshalling the built ScVal: %v", err)
+	}
+	wantBytes, err := want.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshalling the signer's ScVal: %v", err)
+	}
+	if !bytes.Equal(gotBytes, wantBytes) {
+		t.Error("Ed25519SignatureScVal output differs from NewEd25519Signer output")
+	}
+
+	for _, tt := range []struct {
+		name string
+		pub  []byte
+		sig  []byte
+	}{
+		{"short public key", raw[:31], signature},
+		{"long public key", append(append([]byte{}, raw...), 0), signature},
+		{"short signature", raw, signature[:63]},
+		{"long signature", raw, append(append([]byte{}, signature...), 0)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Ed25519SignatureScVal(tt.pub, tt.sig); err == nil {
+				t.Error("Ed25519SignatureScVal accepted a wrong-length value, want an error")
+			}
+		})
+	}
+}
+
+func ExampleNewEd25519Signer() {
+	kp, _ := keypair.FromRawSeed([32]byte{1, 2, 3})
+	signer := NewEd25519Signer(kp)
+	fmt.Printf("signer address: %s\n", signer.Address())
+
+	// Output: signer address: GARB7ZPWQWNBUT7MPECXZHJSZDJ7YNLOCRFR3I5Q7EAW55XSTCENUEPG
+}
+
+func ExampleNewAccountMultiSigner() {
+	kp1, _ := keypair.FromRawSeed([32]byte{1, 2, 3})
+	kp2, _ := keypair.FromRawSeed([32]byte{4, 5, 6})
+	// A multisig account address
+	account := "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+	signer, err := NewAccountMultiSigner(account, kp1, kp2)
+	if err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Printf("signer address: %s\n", signer.Address())
+
+	// Output: signer address: GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
+}
+
+func ExampleNewPasskeySignerFromAssertion() {
+	var pubKey ecdsa.PublicKey
+	assertion := &WebAuthnAssertion{
+		AuthenticatorData: make([]byte, 37),
+		ClientDataJSON:    []byte(`{"type":"webauthn.get","challenge":"..."}`),
+		Signature:         make([]byte, 64),
+		ChallengeString:   "...",
+	}
+
+	signer := NewPasskeySignerFromAssertion(
+		"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+		&pubKey,
+		assertion,
+	)
+
+	fmt.Printf("signer address: %s\n", signer.Address())
+
+	// Output: signer address: GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
 }

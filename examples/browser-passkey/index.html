@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>soroauth — passkey demo</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      body {
+        max-width: 56rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        line-height: 1.5;
+      }
+      h1 {
+        font-size: 1.25rem;
+      }
+      label {
+        display: block;
+        margin-top: 0.75rem;
+        font-weight: 600;
+      }
+      input,
+      textarea,
+      button {
+        width: 100%;
+        box-sizing: border-box;
+        font: inherit;
+        margin-top: 0.25rem;
+      }
+      button {
+        margin-top: 1rem;
+        padding: 0.5rem;
+        cursor: pointer;
+      }
+      #log {
+        white-space: pre-wrap;
+        border: 1px solid currentColor;
+        padding: 0.75rem;
+        margin-top: 1rem;
+        min-height: 6rem;
+      }
+      .hint {
+        opacity: 0.75;
+        font-size: 0.85rem;
+      }
+      fieldset {
+        border: 1px solid currentColor;
+        margin-top: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>soroauth — sign and submit a Soroban transfer with a passkey</h1>
+    <p class="hint">
+      The browser builds a native-XLM SAC transfer from the wallet contract,
+      derives the payload from the record-mode simulation with the
+      <code>@soroauth/wasm</code> core, signs it with a passkey as the WebAuthn
+      challenge, re-simulates in enforce mode, submits, and prints the
+      transaction hash and an explorer link. Nothing is asked of a server until
+      the signed entry exists. See <code>README.md</code> in this directory.
+    </p>
+
+    <label for="rpc">Soroban RPC URL</label>
+    <input id="rpc" value="https://soroban-testnet.stellar.org" spellcheck="false" />
+
+    <label for="network">Network passphrase</label>
+    <input id="network" value="Test SDF Network ; September 2015" spellcheck="false" />
+
+    <label for="wallet">Wallet address (C…, the passkey smart account)</label>
+    <input id="wallet" placeholder="C…" spellcheck="false" />
+
+    <label for="destination">Destination address (G… or C…)</label>
+    <input id="destination" placeholder="G…" spellcheck="false" />
+
+    <label for="amount">Amount in stroops (1 XLM = 10000000)</label>
+    <input id="amount" type="number" value="10000000" />
+
+    <label for="payer">Fee payer address (G…)</label>
+    <input id="payer" placeholder="G…" spellcheck="false" />
+
+    <label for="validFor">Signature expiration: ledgers after the latest ledger</label>
+    <input id="validFor" type="number" value="120" />
+
+    <fieldset>
+      <legend>Paying for and submitting the transaction</legend>
+      <p class="hint">
+        A contract account cannot be a transaction source, so somebody else pays
+        the fee. Set a relayer URL to keep every secret out of this page, or
+        paste a throwaway TESTNET fee-payer secret to submit directly. The
+        secret is kept in memory for this one call and is never stored or
+        logged.
+      </p>
+
+      <label for="relayer">Relayer URL (optional; preferred)</label>
+      <input id="relayer" placeholder="https://relayer.example/submit" spellcheck="false" />
+
+      <label for="payerSecret">Testnet fee-payer secret (optional; used only if no relayer)</label>
+      <input id="payerSecret" type="password" placeholder="S…" autocomplete="off" spellcheck="false" />
+    </fieldset>
+
+    <button id="run">Sign and submit with a passkey</button>
+    <div id="log" role="status" aria-live="polite"></div>
+    <p class="hint">Transaction: <a id="explorer" href="#" rel="noreferrer"></a></p>
+
+    <!-- CDN layout with versioned immutable paths and Subresource Integrity hashes -->
+    <script src="https://cdn.jsdelivr.net/npm/@soroauth/wasm@0.1.0/dist/wasm_exec.js" crossorigin="anonymous"></script>
+    <script type="module">
+      import { loadSoroauth } from "https://cdn.jsdelivr.net/npm/@soroauth/wasm@0.1.0/dist/index.js";
+      import { runFlow } from "./app.js";
+      // Initialize via CDN-friendly module loader
+      const soroauth = await loadSoroauth({
+        wasm: "https://cdn.jsdelivr.net/npm/@soroauth/wasm@0.1.0/dist/soroauth.wasm",
+        go: globalThis.Go,
+      });
+      document.getElementById("run").addEventListener("click", async () => {
+        try {
+          await runFlow(soroauth);
+        } catch (err) {
+          console.error(err);
+        }
+      });
+    </script>
+  </body>
+</html>

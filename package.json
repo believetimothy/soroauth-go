@@ -1,0 +1,21 @@
+{
+  "name": "soroauth-go-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Documentation and diagram tooling for soroauth-go",
+  "scripts": {
+    "spellcheck": "cspell --config cspell.json './**/*.md'",
+    "format:md": "prettier --write \"**/*.md\"",
+    "format:md:check": "prettier --check \"**/*.md\"",
+    "diagrams": "node docs/diagrams/render.mjs",
+    "diagrams:check": "node docs/diagrams/render.mjs --check"
+  },
+  "devDependencies": {
+    "@viz-js/viz": "3.31.0",
+    "cspell": "^10.4.0",
+    "prettier": "3.9.10"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

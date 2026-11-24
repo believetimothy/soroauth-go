@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.soroauth</groupId>
+  <artifactId>soroauth-jvm</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>soroauth-jvm</name>
+  <description>JVM binding over the soroauth signing core: preimage, payload, authorization and verification with the same bytes and the same honesty boundaries as the Go library.</description>
+  <url>https://github.com/soroauth/soroauth-go</url>
+
+  <!-- Maven Central requires licenses, developers and scm. See
+    https://central.sonatype.org/publish/requirements/. -->
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>soroauth</id>
+      <name>soroauth contributors</name>
+      <url>https://github.com/soroauth</url>
+      <organization>soroauth</organization>
+      <organizationUrl>https://github.com/soroauth</organizationUrl>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/soroauth/soroauth-go.git</connection>
+    <developerConnection>scm:git:git@github.com:soroauth/soroauth-go.git</developerConnection>
+    <url>https://github.com/soroauth/soroauth-go</url>
+    <tag>HEAD</tag>
+  </scm>
+
+  <issueManagement>
+    <system>GitHub</system>
+    <url>https://github.com/soroauth/soroauth-go/issues</url>
+  </issueManagement>
+
+  <properties>
+    <!-- Minimum JDK: 22, the first release with the Foreign Function and
+      Memory API final. The pure-JVM signing path needs less, but the FFM
+      native binding in this artifact sets the floor, and the floor is
+      stated here rather than implied. -->
+    <maven.compiler.release>22</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <junit.version>5.11.4</junit.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <!-- The golden replay reads testdata/vectors by relative path. -->
+          <workingDirectory>${project.basedir}</workingDirectory>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.2</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+            </manifest>
+          </archive>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <!-- The `release` profile is activated only on the release workflow
+    (`.github/workflows/release-jvm.yml`), which passes `-Prelease`. It
+    adds the Central-required artifacts (sources, javadoc, signatures)
+    and the Central deploy plugin. Developer builds never run it: a
+    local `mvn -B test` must not need gpg. -->
+  <profiles>
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.11.2</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals><goal>jar</goal></goals>
+                <configuration>
+                  <!-- `module-info.java` is not present and the API docs
+                    do not need to cover private members. -->
+                  <show>public</show>
+                  <failOnError>true</failOnError>
+                  <doclint>all,-missing</doclint>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+                <configuration>
+                  <!-- The passphrase comes in as `GPG_PASSPHRASE` from
+                    the workflow and is never written to a file; the key
+                    itself is imported from the `GPG_PRIVATE_KEY` secret
+                    in a transient keyring the job cleans up on exit. -->
+                  <gpgArguments>
+                    <arg>--pinentry-mode</arg>
+                    <arg>loopback</arg>
+                  </gpgArguments>
+                  <passphraseServerId>gpg.passphrase</passphraseServerId>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <!-- Sonatype's Central Publishing plugin uses the new Central
+            Portal (publish.sonatype.com), not legacy OSSRH. See
+            https://central.sonatype.org/publish/publish-portal-maven/. -->
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.8.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <!-- Fail fast rather than queue a draft the workflow would
+                have to poll. -->
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

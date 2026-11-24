@@ -7,6 +7,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,8 +24,17 @@ const referenceSDK = "@stellar/stellar-sdk@17.1.0"
 
 // vectorStep is one signing call to make, in order.
 type vectorStep struct {
-	SignerLabel string  `json:"signer_label"`
-	ForAddress  *string `json:"for_address"`
+	SignerLabel string          `json:"signer_label"`
+	ForAddress  *string         `json:"for_address"`
+	Multisig    *vectorMultisig `json:"multisig,omitempty"`
+}
+
+// vectorMultisig marks a step that is signed with a classic-account multisig
+// signer rather than a single key: the account is SignerLabel's account, and
+// SignerLabels are the keys that sign, sorted by NewAccountMultiSigner exactly
+// as the JS generator sorted them.
+type vectorMultisig struct {
+	SignerLabels []string `json:"signer_labels"`
 }
 
 // vectorDelegate is one node of the delegate tree a vector was built from,
@@ -36,6 +47,7 @@ type vectorDelegate struct {
 
 // vector is one golden case, as written by testdata/gen/gen.mjs.
 type vector struct {
+	SchemaVersion     int              `json:"schema_version"`
 	Name              string           `json:"name"`
 	SDK               string           `json:"sdk"`
 	NetworkPassphrase string           `json:"network_passphrase"`
@@ -49,10 +61,16 @@ type vector struct {
 	SignedEntryXDR    string           `json:"signed_entry_xdr"`
 }
 
-func loadVectors(t *testing.T) []vector {
+func loadVectors(t testing.TB) []vector {
 	t.Helper()
 
-	paths, err := filepath.Glob(filepath.Join("testdata", "vectors", "*.json"))
+	return loadVectorsFrom(t, filepath.Join("testdata", "vectors"))
+}
+
+func loadVectorsFrom(t testing.TB, directory string) []vector {
+	t.Helper()
+
+	paths, err := filepath.Glob(filepath.Join(directory, "*.json"))
 	if err != nil {
 		t.Fatalf("globbing the vector directory: %v", err)
 	}
@@ -75,6 +93,9 @@ func loadVectors(t *testing.T) []vector {
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&v); err != nil {
 			t.Fatalf("decoding %s: %v", path, err)
+		}
+		if v.SchemaVersion != 1 {
+			t.Fatalf("%s has unsupported schema version %d, want 1", path, v.SchemaVersion)
 		}
 		if v.Name == "" {
 			t.Fatalf("%s has no name", path)
@@ -109,11 +130,38 @@ func toDelegates(recorded []vectorDelegate) []Delegate {
 // testdata/gen/gen.mjs does.
 func signerForLabel(t *testing.T, label string) Signer {
 	t.Helper()
+	return NewEd25519Signer(keypairForLabel(t, label))
+}
+
+// keypairForLabel derives the keypair the vector generator derives, so a test
+// can sign as the vector did.
+func keypairForLabel(t *testing.T, label string) *keypair.Full {
+	t.Helper()
 	kp, err := keypair.FromRawSeed(sha256.Sum256([]byte(label)))
 	if err != nil {
 		t.Fatalf("deriving the keypair for %q: %v", label, err)
 	}
-	return NewEd25519Signer(kp)
+	return kp
+}
+
+// signerForStep returns the signer a recorded step calls for: a single ed25519
+// signer, or — for the multisig vector — a classic-account multisig signer over
+// the recorded keys, which NewAccountMultiSigner sorts and caps exactly as the
+// host does.
+func signerForStep(t *testing.T, step vectorStep) Signer {
+	t.Helper()
+	if step.Multisig == nil {
+		return signerForLabel(t, step.SignerLabel)
+	}
+	kps := make([]*keypair.Full, 0, len(step.Multisig.SignerLabels))
+	for _, label := range step.Multisig.SignerLabels {
+		kps = append(kps, keypairForLabel(t, label))
+	}
+	signer, err := NewAccountMultiSigner(keypairForLabel(t, step.SignerLabel).Address(), kps...)
+	if err != nil {
+		t.Fatalf("building the multisig signer for %q: %v", step.SignerLabel, err)
+	}
+	return signer
 }
 
 // TestGoldenVectors is the correctness gate: for every recorded case, the
@@ -227,7 +275,7 @@ func TestGoldenVectors(t *testing.T) {
 					opts = append(opts, ForAddress(*step.ForAddress))
 				}
 				signed, err = AuthorizeEntry(context.Background(), signed,
-					signerForLabel(t, step.SignerLabel),
+					signerForStep(t, step),
 					v.ValidUntilLedger, v.NetworkPassphrase, opts...)
 				if err != nil {
 					t.Fatalf("step %d (%s) returned an unexpected error: %v", i, step.SignerLabel, err)
@@ -270,6 +318,11 @@ func TestGoldenVectorsCoverTheRequiredCases(t *testing.T) {
 
 		"v2_expiration_boundary_1",   // #116: minimum valid expiration
 		"v2_expiration_boundary_max", // #116: near-maximum expiration
+
+		"v2_account_multisig_20_signatures", // #366: the host's 20-signature cap
+		"v2_empty_args",                     // #366: empty argument list
+		"delegates_single_node",             // #366: single-delegate tree
+		"delegates_chain_depth_57",          // #366: deepest accepted nesting
 	}
 
 	present := map[string]bool{}
@@ -281,6 +334,110 @@ func TestGoldenVectorsCoverTheRequiredCases(t *testing.T) {
 			t.Errorf("required golden vector %q is missing", name)
 		}
 	}
+}
+
+func TestGoldenVectorsCoverEveryCredentialArm(t *testing.T) {
+	counts := map[xdr.SorobanCredentialsType]int{
+		xdr.SorobanCredentialsTypeSorobanCredentialsSourceAccount:        0,
+		xdr.SorobanCredentialsTypeSorobanCredentialsAddress:              0,
+		xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2:            0,
+		xdr.SorobanCredentialsTypeSorobanCredentialsAddressWithDelegates: 0,
+	}
+	names := map[xdr.SorobanCredentialsType]string{
+		xdr.SorobanCredentialsTypeSorobanCredentialsSourceAccount:        "source_account",
+		xdr.SorobanCredentialsTypeSorobanCredentialsAddress:              "address",
+		xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2:            "address_v2",
+		xdr.SorobanCredentialsTypeSorobanCredentialsAddressWithDelegates: "address_with_delegates",
+	}
+
+	for _, v := range loadVectors(t) {
+		var entry xdr.SorobanAuthorizationEntry
+		if err := xdr.SafeUnmarshalBase64(v.UnsignedEntryXDR, &entry); err != nil {
+			t.Fatalf("decoding vector %q to classify its credential arm: %v", v.Name, err)
+		}
+		if _, ok := counts[entry.Credentials.Type]; !ok {
+			t.Fatalf("vector %q has unsupported credential arm %s", v.Name, entry.Credentials.Type)
+		}
+		counts[entry.Credentials.Type]++
+	}
+
+	for _, arm := range []xdr.SorobanCredentialsType{
+		xdr.SorobanCredentialsTypeSorobanCredentialsSourceAccount,
+		xdr.SorobanCredentialsTypeSorobanCredentialsAddress,
+		xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2,
+		xdr.SorobanCredentialsTypeSorobanCredentialsAddressWithDelegates,
+	} {
+		t.Logf("credential arm %s: %d vectors", names[arm], counts[arm])
+	}
+	for _, missing := range missingCredentialArms(counts) {
+		t.Errorf("no golden vectors cover credential arm %s", missing)
+	}
+}
+
+func missingCredentialArms(counts map[xdr.SorobanCredentialsType]int) []string {
+	arms := []struct {
+		arm  xdr.SorobanCredentialsType
+		name string
+	}{
+		{xdr.SorobanCredentialsTypeSorobanCredentialsSourceAccount, "source_account"},
+		{xdr.SorobanCredentialsTypeSorobanCredentialsAddress, "address"},
+		{xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2, "address_v2"},
+		{xdr.SorobanCredentialsTypeSorobanCredentialsAddressWithDelegates, "address_with_delegates"},
+	}
+	var missing []string
+	for _, arm := range arms {
+		if counts[arm.arm] == 0 {
+			missing = append(missing, arm.name)
+		}
+	}
+	return missing
+}
+
+func TestGoldenVectorCoverageDetectsRemovedCredentialArm(t *testing.T) {
+	sourcePaths, err := filepath.Glob(filepath.Join("testdata", "vectors", "*.json"))
+	if err != nil {
+		t.Fatalf("globbing source vectors: %v", err)
+	}
+	directory := t.TempDir()
+	removed := 0
+	for _, path := range sourcePaths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		var v vector
+		if err := json.Unmarshal(raw, &v); err != nil {
+			t.Fatalf("decoding %s: %v", path, err)
+		}
+		var entry xdr.SorobanAuthorizationEntry
+		if err := xdr.SafeUnmarshalBase64(v.UnsignedEntryXDR, &entry); err != nil {
+			t.Fatalf("decoding vector %q: %v", v.Name, err)
+		}
+		if entry.Credentials.Type == xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2 {
+			removed++
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(directory, filepath.Base(path)), raw, 0o600); err != nil {
+			t.Fatalf("copying %s to the missing-arm fixture: %v", path, err)
+		}
+	}
+	if removed == 0 {
+		t.Fatal("no address_v2 vectors were available to remove in the regression fixture")
+	}
+
+	counts := make(map[xdr.SorobanCredentialsType]int)
+	for _, v := range loadVectorsFrom(t, directory) {
+		var entry xdr.SorobanAuthorizationEntry
+		if err := xdr.SafeUnmarshalBase64(v.UnsignedEntryXDR, &entry); err != nil {
+			t.Fatalf("decoding vector %q: %v", v.Name, err)
+		}
+		counts[entry.Credentials.Type]++
+	}
+	missing := missingCredentialArms(counts)
+	if len(missing) != 1 || missing[0] != "address_v2" {
+		t.Fatalf("missingCredentialArms() = %v, want [address_v2]", missing)
+	}
+	t.Logf("removing %d address_v2 vectors exposes missing coverage for %s", removed, missing[0])
 }
 
 // TestGoldenPayloadsAreDistinct checks the separations §5.9 calls for, using
@@ -529,4 +686,59 @@ func TestGoldenVectorSignsOneAddressAtTwoLevelsInOneStep(t *testing.T) {
 	if total != 2 || nowSigned != 2 {
 		t.Errorf("after one step, %d of %d nodes are signed; want 2 of 2", nowSigned, total)
 	}
+}
+
+// TestGoldenStructuralBoundaries pins the structural-limit vectors (#366).
+//
+// The multisig vector carries exactly the host's MAX_ACCOUNT_SIGNATURES = 20
+// account signatures — the constant the host's account contract enforces, not a
+// number copied from the issue — and 21 signing keys are refused up front with
+// ErrTooManySignatures, before any signing happens, so an account whose policy
+// exceeds the cap fails locally instead of on-chain after fees are paid.
+func TestGoldenStructuralBoundaries(t *testing.T) {
+	t.Run("twenty signatures is the cap", func(t *testing.T) {
+		v := findVector(t, "v2_account_multisig_20_signatures")
+
+		var signed xdr.SorobanAuthorizationEntry
+		if err := xdr.SafeUnmarshalBase64(v.SignedEntryXDR, &signed); err != nil {
+			t.Fatalf("decoding the signed entry: %v", err)
+		}
+		credentials, err := addressCredentials(signed.Credentials)
+		if err != nil {
+			t.Fatalf("reading the signed credentials: %v", err)
+		}
+		if credentials.Signature.Type != xdr.ScValTypeScvVec ||
+			credentials.Signature.Vec == nil || *credentials.Signature.Vec == nil {
+			t.Fatalf("the signed entry's signature is %s, want a vector", credentials.Signature.Type)
+		}
+		if got := len(**credentials.Signature.Vec); got != maxAccountSignatures {
+			t.Errorf("the vector carries %d account signatures, want %d", got, maxAccountSignatures)
+		}
+	})
+
+	t.Run("twenty-one signatures is refused", func(t *testing.T) {
+		v := findVector(t, "v2_account_multisig_20_signatures")
+
+		var entry xdr.SorobanAuthorizationEntry
+		if err := xdr.SafeUnmarshalBase64(v.UnsignedEntryXDR, &entry); err != nil {
+			t.Fatalf("decoding the unsigned entry: %v", err)
+		}
+		credentials, err := addressCredentials(entry.Credentials)
+		if err != nil {
+			t.Fatalf("reading the credentials: %v", err)
+		}
+		account, err := FormatAddress(credentials.Address)
+		if err != nil {
+			t.Fatalf("formatting the account address: %v", err)
+		}
+
+		// One more than the vector's own cap, using distinct keys.
+		kps := make([]*keypair.Full, 0, maxAccountSignatures+1)
+		for i := 0; i <= maxAccountSignatures; i++ {
+			kps = append(kps, keypairForLabel(t, fmt.Sprintf("soroauth-vector-multisig-key-%02d", i)))
+		}
+		if _, err := NewAccountMultiSigner(account, kps...); !errors.Is(err, ErrTooManySignatures) {
+			t.Fatalf("NewAccountMultiSigner with %d keys returned %v, want ErrTooManySignatures", len(kps), err)
+		}
+	})
 }

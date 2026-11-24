@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/xdr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestInspectReportsTheArm(t *testing.T) {
@@ -182,6 +186,71 @@ func TestInspectReportsCreateContractWithoutAFunction(t *testing.T) {
 	}
 }
 
+func TestInspectNodeInfoJSONGolden(t *testing.T) {
+	buf := make([]byte, 64)
+	shape := DescribeSignature(xdr.ScVal{
+		Type:  xdr.ScValTypeScvBytes,
+		Bytes: (*xdr.ScBytes)(&buf),
+	})
+	node := NodeInfo{
+		Address: "GBEXAMPLE",
+		Signed:  true,
+		Shape:   &shape,
+	}
+	data, err := json.Marshal(node)
+	if err != nil {
+		fn := t.Fatalf
+		fn("marshaling node info: %v", err)
+	}
+	// Verify JSON serialization includes the Shape field correctly and matches golden schema expectations
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("unmarshaling node info: %v", err)
+	}
+	if _, ok := m["shape"]; !ok {
+		t.Error("serialized NodeInfo json is missing 'shape' field")
+	}
+	if m["address"] != "GBEXAMPLE" {
+		t.Errorf("expected address GBEXAMPLE, got %v", m["address"])
+	}
+	if m["signed"] != true {
+		t.Errorf("expected signed true, got %v", m["signed"])
+	}
+	// Verify backwards compatibility of omitting Shape when nil
+	nilShapeNode := NodeInfo{
+		Address: "GBEXAMPLE",
+		Signed:  false,
+	}
+	dataNil, err := json.Marshal(nilShapeNode)
+	if err != nil {
+		t.Fatalf("marshaling node info with nil shape: %v", err)
+	}
+	var mNil map[string]any
+	if err := json.Unmarshal(dataNil, &mNil); err != nil {
+		t.Fatalf("unmarshaling node info with nil shape: %v", err)
+	}
+	if _, ok := mNil["shape"]; ok {
+		t.Error("serialized NodeInfo json should omit 'shape' field when nil for backwards compatibility")
+	}
+
+	// Test vector ScValTypeScvVec signature description explicitly
+	vecVal := xdr.ScVal{Type: xdr.ScValTypeScvVec}
+	vecShape := DescribeSignature(vecVal)
+	if vecShape.Type != SignatureShapeUnknown {
+		t.Errorf("vector shape type is %v, want %v", vecShape.Type, SignatureShapeUnknown)
+	}
+	if !strings.Contains(vecShape.Description, "vector structure signature") {
+		t.Errorf("vector shape description is %q, want it to mention vector structure signature", vecShape.Description)
+	}
+
+	// Test nil Bytes pointer safety
+	nilBytesVal := xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: nil}
+	nilBytesShape := DescribeSignature(nilBytesVal)
+	if nilBytesShape.Type != SignatureShapeUnknown {
+		t.Errorf("nil bytes shape type is %v, want %v", nilBytesShape.Type, SignatureShapeUnknown)
+	}
+}
+
 func TestInspectReportsTheDelegateTree(t *testing.T) {
 	base := entryForArm(t, xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2, 42)
 	d1 := testKeypair(t, "soroauth-delegate-1").Address()
@@ -299,6 +368,37 @@ func TestInspectShowsMisorderedDelegates(t *testing.T) {
 	}
 }
 
+func TestDescribeSignatureVectorShape(t *testing.T) {
+	sig := xdr.ScVal{Type: xdr.ScValTypeScvVec}
+	shape := DescribeSignature(sig)
+	if shape.Type != SignatureShapeUnknown {
+		t.Errorf("got type %v, want %v", shape.Type, SignatureShapeUnknown)
+	}
+	if shape.Description != "vector structure signature" {
+		t.Errorf("got description %q, want %q", shape.Description, "vector structure signature")
+	}
+}
+
+func TestNodeInfoShapeSerializationGolden(t *testing.T) {
+	shape := SignatureShape{
+		Type:        SignatureShapePasskey,
+		Description: "64-byte binary passkey signature",
+	}
+	node := NodeInfo{
+		Address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+		Signed:  true,
+		Shape:   &shape,
+	}
+	data, err := json.Marshal(node)
+	if err != nil {
+		t.Fatalf("marshaling NodeInfo: %v", err)
+	}
+	expected := `{"address":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF","signed":true,"shape":{"type":"passkey","description":"64-byte binary passkey signature"}}`
+	if string(data) != expected {
+		t.Errorf("NodeInfo JSON serialization mismatch:\n got: %s\nwant: %s", string(data), expected)
+	}
+}
+
 func TestInspectSerialisesToJSON(t *testing.T) {
 	base := entryForArm(t, xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2, 42)
 	entry, err := WithDelegates(base, testValidUntilLedger,
@@ -380,6 +480,37 @@ func TestInspectRejects(t *testing.T) {
 	}
 }
 
+// TestInspectRejectsUnsupportedFunctionType asserts that Inspect returns
+// ErrUnsupportedFunctionType for an invocation whose function type is not
+// handled by this library.
+func TestInspectRejectsUnsupportedFunctionType(t *testing.T) {
+	entry := xdr.SorobanAuthorizationEntry{
+		Credentials: xdr.SorobanCredentials{
+			Type: xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2,
+			AddressV2: &xdr.SorobanAddressCredentials{
+				Address: mustParse(t, testKeypair(t, "soroauth-inspect-unsupported").Address()),
+				Nonce:   xdr.Int64(1),
+			},
+		},
+		RootInvocation: xdr.SorobanAuthorizedInvocation{
+			Function: xdr.SorobanAuthorizedFunction{
+				Type: xdr.SorobanAuthorizedFunctionType(99),
+			},
+		},
+	}
+
+	got, err := Inspect(entry)
+	if err == nil {
+		t.Fatal("Inspect succeeded on an unsupported function type, want an error")
+	}
+	if !errors.Is(err, ErrUnsupportedFunctionType) {
+		t.Errorf("Inspect returned %q, want %q", err, ErrUnsupportedFunctionType)
+	}
+	if got.CredentialType != "" {
+		t.Errorf("Inspect returned EntryInfo alongside an error: %+v", got)
+	}
+}
+
 // mustParse is a test helper for addresses known to be valid.
 func mustParse(t *testing.T, address string) xdr.ScAddress {
 	t.Helper()
@@ -388,4 +519,255 @@ func mustParse(t *testing.T, address string) xdr.ScAddress {
 		t.Fatalf("parsing %q: %v", address, err)
 	}
 	return parsed
+}
+
+func TestDescribeSignatureShapes(t *testing.T) {
+	// Void signature
+	shapeVoid := DescribeSignature(xdr.ScVal{Type: xdr.ScValTypeScvVoid})
+	assert.Equal(t, SignatureShapeUnknown, shapeVoid.Type)
+
+	// Vec signature
+	vec := &xdr.ScVec{}
+	shapeVec := DescribeSignature(xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &vec})
+	assert.Equal(t, SignatureShapeUnknown, shapeVec.Type)
+
+	// Map signature
+	m := &xdr.ScMap{}
+	shapeMap := DescribeSignature(xdr.ScVal{Type: xdr.ScValTypeScvMap, Map: &m})
+	assert.Equal(t, SignatureShapeMap, shapeMap.Type)
+
+	// Bytes signature
+	b := xdr.ScBytes([]byte{1, 2, 3})
+	shapeBytes := DescribeSignature(xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &b})
+	assert.Equal(t, SignatureShapeUnknown, shapeBytes.Type)
+}
+
+// TestInspectEmptyUnionArms covers the empty-union-arm cases the fuzz target
+// cannot reach.
+//
+// A successfully decoded entry always has its union arm allocated — the XDR
+// decoder allocates the arm the discriminant names — so no byte string fed to
+// FuzzInspect produces a nil arm. The reachable path is a caller handing Inspect
+// a hand-built struct whose discriminant and arm disagree, which is what this
+// asserts directly: an error naming which arm was empty, and a zero EntryInfo
+// alongside it, never a half-populated one.
+func TestInspectEmptyUnionArms(t *testing.T) {
+	tests := []struct {
+		name    string
+		entry   xdr.SorobanAuthorizationEntry
+		wantErr string
+	}{
+		{
+			name: "legacy address arm",
+			entry: xdr.SorobanAuthorizationEntry{
+				Credentials: xdr.SorobanCredentials{
+					Type: xdr.SorobanCredentialsTypeSorobanCredentialsAddress,
+				},
+			},
+			wantErr: "address credentials arm is empty",
+		},
+		{
+			name: "v2 arm",
+			entry: xdr.SorobanAuthorizationEntry{
+				Credentials: xdr.SorobanCredentials{
+					Type: xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2,
+				},
+			},
+			wantErr: "address_v2 credentials arm is empty",
+		},
+		{
+			name: "delegates arm",
+			entry: xdr.SorobanAuthorizationEntry{
+				Credentials: xdr.SorobanCredentials{
+					Type: xdr.SorobanCredentialsTypeSorobanCredentialsAddressWithDelegates,
+				},
+			},
+			wantErr: "address_with_delegates credentials arm is empty",
+		},
+		{
+			name: "contract_fn invocation arm",
+			entry: xdr.SorobanAuthorizationEntry{
+				Credentials: xdr.SorobanCredentials{
+					Type: xdr.SorobanCredentialsTypeSorobanCredentialsSourceAccount,
+				},
+				RootInvocation: xdr.SorobanAuthorizedInvocation{
+					Function: xdr.SorobanAuthorizedFunction{
+						Type: xdr.SorobanAuthorizedFunctionTypeSorobanAuthorizedFunctionTypeContractFn,
+					},
+				},
+			},
+			wantErr: "contract_fn invocation arm is empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info, err := Inspect(tt.entry)
+
+			require.Error(t, err, "an empty union arm must be an error, not a partial report")
+			assert.Contains(t, err.Error(), tt.wantErr,
+				"the error must name which arm was empty")
+			assert.Equal(t, EntryInfo{}, info,
+				"Inspect must not return a populated EntryInfo alongside an error")
+		})
+		// handled by this library.
+		entry := xdr.SorobanAuthorizationEntry{
+			Credentials: xdr.SorobanCredentials{
+				Type: xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2,
+				AddressV2: &xdr.SorobanAddressCredentials{
+					Address: mustParse(t, testKeypair(t, "soroauth-inspect-unsupported").Address()),
+					Nonce:   xdr.Int64(1),
+				},
+			},
+			RootInvocation: xdr.SorobanAuthorizedInvocation{
+				Function: xdr.SorobanAuthorizedFunction{
+					Type: xdr.SorobanAuthorizedFunctionType(99),
+				},
+			},
+		}
+
+		got, err := Inspect(entry)
+		if err == nil {
+			t.Fatal("Inspect succeeded on an unsupported function type, want an error")
+		}
+		if !errors.Is(err, ErrUnsupportedFunctionType) {
+			t.Errorf("Inspect returned %q, want %q", err, ErrUnsupportedFunctionType)
+		}
+		if got.CredentialType != "" {
+			t.Errorf("Inspect returned EntryInfo alongside an error: %+v", got)
+		}
+	}
+}
+
+func FuzzInspect(f *testing.F) {
+	// f is passed to the helpers directly, which take testing.TB. A
+	// &testing.T{} literal would be an uninitialised struct: Helper() and
+	// Fatalf() on one panic rather than reporting, so a seed that failed to
+	// build would take the target down instead of failing it.
+	for _, vec := range loadVectors(f) {
+		var entry xdr.SorobanAuthorizationEntry
+		if err := xdr.SafeUnmarshalBase64(vec.UnsignedEntryXDR, &entry); err == nil {
+			raw, err := entry.MarshalBinary()
+			if err == nil {
+				f.Add(raw)
+			}
+		}
+	}
+
+	baseSeed := entryForArm(f, xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2, 42)
+	if raw, err := baseSeed.MarshalBinary(); err == nil {
+		f.Add(raw)
+	}
+
+	// Truncations of a real entry. Each one either fails to decode — which the
+	// target returns on — or decodes to something structurally short of what
+	// Inspect expects, which is the shape worth reaching. Seeding these is what
+	// makes the fuzzer start near the boundary instead of finding it by luck.
+	if raw, err := baseSeed.MarshalBinary(); err == nil {
+		for _, n := range []int{0, 1, 4, 8, len(raw) / 4, len(raw) / 2, len(raw) - 1} {
+			if n >= 0 && n <= len(raw) {
+				f.Add(raw[:n])
+			}
+		}
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var entry xdr.SorobanAuthorizationEntry
+		if err := entry.UnmarshalBinary(data); err != nil {
+			return
+		}
+		info, err := Inspect(entry)
+		if err != nil {
+			if !reflect.DeepEqual(info, EntryInfo{}) {
+				t.Errorf("Inspect returned a non-empty EntryInfo alongside an error: %+v, err: %v", info, err)
+			}
+		}
+	})
+}
+
+// TestEntryInfoStringGolden verifies the String() output matches the golden format.
+// This test ensures that formatting changes are visible as diffs rather than surprises.
+func TestEntryInfoStringGolden(t *testing.T) {
+	tests := []struct {
+		name string
+		info EntryInfo
+		want string
+	}{
+		{
+			name: "source account",
+			info: EntryInfo{
+				CredentialType: CredentialTypeSourceAccount,
+				TopLevelSigned: false,
+			},
+			want: "(no address) (unsigned) [source_account]\n",
+		},
+		{
+			name: "address v2 signed",
+			info: EntryInfo{
+				CredentialType:   CredentialTypeAddressV2,
+				Address:          "GC33NWBJFXQSQMD3AMHTFEFT36IH5ZBG24L5RZMQGKO2SPBTVB74VZI5",
+				TopLevelSigned:   true,
+				Nonce:            42,
+				ValidUntilLedger: 1234567,
+				AddressBound:     true,
+			},
+			want: "GC33NWBJFXQSQMD3AMHTFEFT36IH5ZBG24L5RZMQGKO2SPBTVB74VZI5 (signed) [address_v2]\n  nonce: 42\n  valid until ledger: 1234567\n  address-bound: yes\n",
+		},
+		{
+			name: "address with delegates unsigned",
+			info: EntryInfo{
+				CredentialType: CredentialTypeAddressWithDelegates,
+				Address:        "GTOP",
+				TopLevelSigned: false,
+				AddressBound:   true,
+				Delegates: []NodeInfo{
+					{Address: "GA", Signed: true, Shape: &SignatureShape{Type: SignatureShapeMap, Description: "map structure signature"}},
+					{Address: "GB", Signed: false},
+				},
+			},
+			want: "GTOP (unsigned) [address_with_delegates]\n  address-bound: yes\n\ndelegate tree:\n├── GA (signed)\n              shape: map structure signature\n└── GB (unsigned)\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.info.String()
+			if got != tt.want {
+				t.Errorf("String() output mismatch:\n got:\n%s want:\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEntryInfoStringDoesNotPanic verifies String() never panics on pathological values.
+func TestEntryInfoStringDoesNotPanic(t *testing.T) {
+	// Very deep delegate tree (within MaxDecodeDepth)
+	deep := EntryInfo{
+		CredentialType: CredentialTypeAddressWithDelegates,
+		Address:        "GTOP",
+		TopLevelSigned: true,
+	}
+	cursor := &deep.Delegates
+	for i := 0; i < 50; i++ {
+		*cursor = []NodeInfo{{Address: fmt.Sprintf("G%d", i), Signed: i%2 == 0}}
+		cursor = &(*cursor)[0].Nested
+	}
+	_ = deep.String() // Should not panic
+
+	// Very large numbers
+	large := EntryInfo{
+		CredentialType:   CredentialTypeAddressV2,
+		Address:          "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+		TopLevelSigned:   true,
+		Nonce:            math.MaxInt64,
+		ValidUntilLedger: math.MaxUint32,
+		AddressBound:     true,
+		RootContract:     "C" + strings.Repeat("A", 50),
+		RootFunction:     "transfer",
+		SubInvocations:   1000000,
+	}
+	_ = large.String() // Should not panic
+
+	// Empty strings
+	empty := EntryInfo{}
+	_ = empty.String() // Should not panic
 }

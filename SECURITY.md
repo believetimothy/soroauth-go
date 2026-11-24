@@ -1,71 +1,110 @@
-# Security policy
-
-## Reporting a vulnerability
-
-**Do not open a public issue.**
-
-Report privately through GitHub Security Advisories:
-[github.com/soroauth/soroauth-go/security/advisories/new](https://github.com/soroauth/soroauth-go/security/advisories/new).
-
-Please include what you can: the affected version or commit, what an attacker
-achieves, and a reproduction — a failing test, an entry that signs when it
-should not, or a payload that differs from the reference implementation.
-
-You will get an acknowledgement within a week. This is a small project with no
-paid on-call, so that is a realistic commitment rather than an optimistic one.
-If a fix is needed you will be credited in the advisory and the changelog unless
-you ask otherwise.
-
-## Scope
-
-**Signature-correctness bugs are critical.** Anything in these categories should
-be reported privately rather than filed publicly:
-
-- A signature produced over the wrong payload: wrong preimage variant, wrong
-  network id, wrong nonce, wrong expiration, or an address bound in that is not
-  the one the caller named.
-- A signature written onto a credential node other than the intended target, or
-  onto a node whose address does not match.
-- An entry accepted for signing that should have been refused — an
-  already-signed node silently overwritten, a delegates array accepted
-  out of order or with duplicates, an expiration that disagrees with signatures
-  already on the entry.
-- Any way to make the library emit an entry whose stored expiration differs from
-  the expiration that was signed over.
-- A secret reaching stdout, stderr, an error message, a log, or disk. The CLI
-  accepts seeds only through a named environment variable and must never print
-  one, including on error paths.
-- Divergence from the golden vectors that is not a bug in the vectors.
-
-Lower severity, still worth reporting privately if you are unsure: panics
-reachable from untrusted input, and denial of service through malformed XDR.
-
-**Out of scope:** the fixture contract in `e2e/contracts/` is test code, not a
-product — it has no admin functions, no upgradability and no policy engine by
-design, and findings about those absences are not vulnerabilities. Weaknesses in
-the Stellar protocol itself belong with the
-[Stellar Development Foundation](https://github.com/stellar/stellar-protocol/blob/master/SECURITY.md),
-not here.
+# Security Policy
 
 ## Status of this library
 
-**v0.1.0, unaudited.** No third party has reviewed this code. It is proven
-byte-for-byte against `@stellar/stellar-sdk@17.1.0` by nine golden vectors, and
-proven against a live host by the testnet scenarios in
-[e2e/RESULTS.md](e2e/RESULTS.md) — but agreeing with a reference implementation
-and being accepted by a host are not the same thing as having been audited, and
-neither rules out a class of bug that both implementations share.
+This library is unaudited. No claim of an audit or production proof is made.
 
-Judge it accordingly before signing anything valuable with it, and read the code.
+## Supported Versions
 
-## Supported versions
+Use this table to determine which versions are currently being supported with
+security fixes.
 
-Only the latest release receives fixes. At v0.1.0 that is the only release.
+| Version          | Supported          |
+| ---------------- | ------------------ |
+| v0.1.0           | :white_check_mark: |
+| Earlier versions | :x:                |
 
-## Keys in this repository
+## Reporting a Vulnerability
 
-Every keypair in `testdata/` is derived deterministically from a label committed
-in plain text, so those keys are public and anyone can spend from them. They
-exist to make signatures reproducible. Never fund them on mainnet. No key used
-by the e2e tests is written to disk; they are generated per run and funded by
-friendbot on testnet.
+If you discover a security vulnerability in this library, please report it via
+GitHub Security Advisories.
+
+### What to Include
+
+- **Title**: Clear, concise description of the issue
+- **Context**: How the vulnerability can be exploited
+- **Impact**: What an attacker could achieve
+- **Reproduction Steps**: Minimal steps to reproduce the issue
+- **Expected vs Actual Behavior**: What should happen vs what happens
+- **Test Keys/Entries**: If applicable, the test vectors that demonstrate the
+  issue
+
+### What Is Out of Scope
+
+- Documentation improvements or typos
+- Feature requests
+- Performance optimizations
+- Use of the library in unsafe ways (this library is designed for correct
+  signing; misuse is out of scope)
+
+### Response Timeline
+
+- **Initial response**: Within 5 business days
+- **Triage**: Within 10 business days — maintainers will confirm, categorize,
+  and assign severity
+- **Fix Etch**: Target within 30 business days for critical issues, 90 days for
+  medium
+- **Public Disclosure**: Coordinated disclosure with the reporter, typically 90
+  days after a fix is released
+
+### Reporting Format
+
+Use the GitHub Security Advisory form when creating the issue. The form includes
+sections for:
+
+1. **Advisory Link**: Will be auto-generated
+2. **What to include**: As described above
+3. **Out of scope**: As described above
+4. **Supported versions**: As described above
+5. **Acknowledgements**: Reporters will be acknowledged (unless requesting
+   anonymity)
+
+### Key Management
+
+This library does not manage cryptographic keys. Signers are an interface, and
+the only shipped implementation is an in-memory ed25519 signer. Key management,
+keystores, KMS integration, and wallet connections are out of scope for this
+library and should be handled by the caller.
+
+## Security Scopes
+
+The following types of issues are considered **critical** and should be reported
+immediately:
+
+- **Signature correctness bugs**: Any issue where signatures produced by the
+  library do not verify on-chain, potentially moving money to unintended
+  recipients
+- **Wire format deviations**: Any change to the XDR wire format that breaks
+  compatibility with the Stellar network or golden vectors
+- **Replay vulnerabilities**: Issues that allow a valid signature to be replayed
+  in a different context
+- **Credential arm mismanagement**: Issues where the wrong credential arm is
+  used or written
+
+The following are **not** considered security issues:
+
+- The library being "un audited" or "unproven" (this is explicitly stated in the
+  software)
+- Missing features (passkey support, secp256r1, etc.) - these are contributor
+  issues
+- Documentation typos or formatting issues
+- CLI usability improvements
+- Benchmark results
+
+## Security Contact
+
+- **GitHub Security Advisories**: Use the form at
+  `https://github.com/soroauth/soroauth-go/security/advisories/new`
+- **Email**: Not applicable - use the GitHub form only
+
+## Verifying a Fix
+
+After a fix is released, the following should pass:
+
+1. `go test ./...` (unit tests, no network)
+2. `go test -run TestReadmeSnippetsMatchTheirSource -v` (README snippets match
+   source)
+3. `make vectors-check` (golden vectors byte-for-byte match)
+4. `go vet ./...` (no vet issues)
+
+All three must pass before a security fix is considered verified.

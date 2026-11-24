@@ -1,0 +1,240 @@
+# Continuous fuzzing that runs beyond CI's time budget.
+#
+# Go's fuzzer finds real bugs given minutes and hours; the push-to-main smoke
+# in ci-go.yml can only spare seconds per target, so this workflow runs the
+# same native targets longer: nightly on a schedule, on every push to main,
+# and on demand with a caller-chosen budget. It uses the toolchain's own
+# fuzzer (`go test -fuzz=...`), not an external harness, so a finding
+# reproduces with one local command — see docs/fuzzing.md.
+#
+# On a finding the job files (or comments on) one issue per target carrying
+# the reproducer, and the fuzzer's cache is persisted across runs so each run
+# resumes where the last one left off. Nothing is auto-committed: a crash
+# reproducer becomes a committed regression seed through an ordinary pull
+# request, like any other change.
+#
+# The same workflow carries the scheduled batch signing soak (`soak` below):
+# the golden vectors signed continuously, under the race detector, with the
+# goroutine count and live heap asserted against a warm-up baseline after
+# every round. It is the steady-state counterpart to the searches above —
+# see docs/soak.md for a reported run and the measurements behind the
+# tolerances.
+name: continuous-fuzz
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # Daily at 03:00 UTC
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: 'Per-target fuzz time (Go duration, e.g. 5m, 30m, 1h)'
+        default: '15m'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: FuzzValidateDelegateOrder
+            package: .
+            corpus: testdata/fuzz/FuzzValidateDelegateOrder
+          - target: FuzzInspect
+            package: .
+            corpus: testdata/fuzz/FuzzInspect
+          - target: FuzzPreimage
+            package: .
+            corpus: testdata/fuzz/FuzzPreimage
+          - target: FuzzPayload
+            package: .
+            corpus: testdata/fuzz/FuzzPayload
+          - target: FuzzDecodeAuthorizationEntry
+            package: .
+            corpus: testdata/fuzz/FuzzDecodeAuthorizationEntry
+          - target: FuzzVerifyEntry
+            package: .
+            corpus: testdata/fuzz/FuzzVerifyEntry
+          - target: FuzzDiffEntries
+            package: .
+            corpus: testdata/fuzz/FuzzDiffEntries
+          - target: FuzzCanonicalJSON
+            package: .
+            corpus: testdata/fuzz/FuzzCanonicalJSON
+          - target: FuzzCopyRoundTrip
+            package: ./internal/xdrcopy
+            corpus: internal/xdrcopy/testdata/fuzz/FuzzCopyRoundTrip
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: record tool versions
+        run: bash .github/scripts/record-tool-versions.sh go .
+
+      # The fuzzer keeps its interesting-inputs cache under GOCACHE/fuzz.
+      # Restoring it means each run mutates from where the last one left
+      # off instead of rediscovering the seed corpus every night; the
+      # cache action's post step saves it again even when fuzzing fails.
+      - name: restore the fuzzer cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build/fuzz
+          key: fuzz-${{ matrix.target }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-${{ matrix.target }}-${{ github.ref_name }}-
+            fuzz-${{ matrix.target }}-
+
+      - name: fuzz ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          # workflow_dispatch supplies FUZZTIME; schedule and push fall back
+          # to the nightly budget.
+          go test -run '^$' -fuzz '${{ matrix.target }}' \
+            -fuzztime "${FUZZTIME:-15m}" \
+            '${{ matrix.package }}' 2>&1 | tee fuzz-${{ matrix.target }}.log
+        env:
+          FUZZTIME: ${{ inputs.fuzztime }}
+
+      # A failing run writes the reproducer into the target's seed-corpus
+      # directory, where it already runs as a regression subtest. Report it
+      # rather than committing it: the fix and its seed land through review.
+      - name: report a finding
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          target='${{ matrix.target }}'
+          corpus='${{ matrix.corpus }}'
+          title="[fuzz] ${target} found a failing input"
+
+          {
+            echo "The continuous fuzzer failed \`${target}\`"
+            echo "(\`${{ matrix.package }}\`) on run"
+            echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+            echo
+            echo '```'
+            tail -30 "fuzz-${target}.log"
+            echo '```'
+            echo
+            echo "## Reproduce locally"
+            echo
+            echo '```sh'
+            echo "go test -run '^$' -fuzz ${target} -fuzztime 30s ${{ matrix.package }}"
+            echo '```'
+          } > issue.md
+
+          if [ -d "$corpus" ] && [ -n "$(git status --porcelain -uall -- "$corpus")" ]; then
+            {
+              echo
+              echo "## Reproducers this run wrote"
+              echo
+              echo "Each file below is already in Go's seed-corpus format:"
+              echo "commit it under \`$corpus/\` with the fix so it keeps"
+              echo "running as a regression subtest (see docs/fuzzing.md)."
+              git status --porcelain -uall -- "$corpus" | awk '{print $2}' | while read -r f; do
+                # -uall can still name a directory; only files carry a reproducer.
+                [ -f "$f" ] || continue
+                echo
+                echo "### \`$f\`"
+                echo
+                echo '```sh'
+                echo "base64 -d > \"$f\" <<'EOF'"
+                base64 -w0 -- "$f"
+                echo
+                echo "EOF"
+                echo '```'
+              done
+            } >> issue.md
+          fi
+
+          existing=$(gh issue list --search "$title in:title" --state open \
+            --json number,title --jq --arg t "$title" '[.[] | select(.title == $t) | .number]')
+          count=$(echo "$existing" | jq 'length')
+          if [ "$count" -gt 0 ]; then
+            echo "An open issue already covers ${target}; commenting with the new run."
+            echo "$existing" | jq -r '.[0]' | xargs -I{} gh issue comment {} --body-file issue.md
+          else
+            gh issue create --title "$title" --body-file issue.md
+          fi
+
+  # The batch signing soak: the committed golden vectors signed continuously
+  # from several goroutines for ten minutes, with the race detector on, and
+  # after every round an assertion that the bytes still match the vectors and
+  # that the goroutine count and live heap settled back to the baseline taken
+  # after the warm-up. The fuzz jobs above search for new inputs; this one
+  # watches the steady state the service actually runs in, which a single
+  # `go test -race` run is too short to say anything about. docs/soak.md
+  # reports a real run and the measurements the tolerances come from.
+  soak:
+    name: soak TestSoakBatchSigning
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: record tool versions
+        run: bash .github/scripts/record-tool-versions.sh go .
+
+      # -timeout must stay above -soak-duration: Go's default test timeout is
+      # 10m, and without a larger one a ten-minute soak would be killed just
+      # before it finishes and had no chance to print its final round.
+      - name: soak the batch signing path
+        run: |
+          set -o pipefail
+          go test -race -tags soak -run TestSoakBatchSigning \
+            -soak-duration 10m -timeout 20m . 2>&1 | tee soak.log
+
+      # A failed soak is a finding about the library, not a flake: the round
+      # lines in the log name the first round in which the bytes, the
+      # goroutines or the heap went wrong. Report it the way the fuzz jobs do
+      # rather than only failing the run.
+      - name: report a finding
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title='[soak] TestSoakBatchSigning failed'
+
+          {
+            echo "The batch signing soak failed on run"
+            echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+            echo
+            echo '```'
+            tail -30 soak.log || true
+            echo '```'
+            echo
+            echo '## Reproduce locally'
+            echo
+            echo '```sh'
+            echo 'make soak SOAKTIME=10m'
+            echo '# or, directly:'
+            echo "go test -race -tags soak -run TestSoakBatchSigning -soak-duration 10m -timeout 20m ."
+            echo '```'
+            echo
+            echo 'docs/soak.md has what each round asserts and how the tolerances were measured.'
+          } > issue.md
+
+          existing=$(gh issue list --search "$title in:title" --state open \
+            --json number,title --jq --arg t "$title" '[.[] | select(.title == $t) | .number]')
+          count=$(echo "$existing" | jq 'length')
+          if [ "$count" -gt 0 ]; then
+            echo "An open issue already covers the soak; commenting with the new run."
+            echo "$existing" | jq -r '.[0]' | xargs -I{} gh issue comment {} --body-file issue.md
+          else
+            gh issue create --title "$title" --body-file issue.md
+          fi

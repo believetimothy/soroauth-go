@@ -13,9 +13,8 @@ import (
 	xdrcodec "github.com/stellar/go-xdr/xdr3"
 )
 
-// testAddress derives a deterministic public test account from a label, the
-// scheme every soroauth test uses. These keys are public by construction and
-// must never be funded on mainnet.
+// testAddress derives a public test account from a label; see
+// CONTRIBUTING.md#deterministic-test-keys.
 func testAddress(t *testing.T, label string) xdr.ScAddress {
 	t.Helper()
 	kp, err := keypair.FromRawSeed(sha256.Sum256([]byte(label)))
@@ -270,6 +269,44 @@ func bigEntry(t *testing.T) xdr.SorobanAuthorizationEntry {
 // re-marshalled afterwards too, to catch a copy that mutated them.
 //
 // Run it with -race; CI does (the `test` job runs `go test -race ./...`).
+func FuzzCopyRoundTrip(f *testing.F) {
+	sampleBytes := mustMarshal(&testing.T{}, sampleEntry(&testing.T{}))
+	f.Add(sampleBytes)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var entry xdr.SorobanAuthorizationEntry
+		err := entry.UnmarshalBinary(data)
+		if err != nil {
+			return
+		}
+
+		// If the entry unmarshalled successfully but contains nil pointer union arms
+		// that would panic during marshalling, check with a safe marshal first or recover.
+		// Specifically, union arms like ContractFn or AddressV2 might be nil if malformed data
+		// decoded a discriminant without allocating the arm struct.
+		if entry.Credentials.Type == xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2 && entry.Credentials.AddressV2 == nil {
+			return
+		}
+		if entry.Credentials.Type == xdr.SorobanCredentialsTypeSorobanCredentialsAddress && entry.Credentials.Address == nil {
+			return
+		}
+		if entry.RootInvocation.Function.Type == xdr.SorobanAuthorizedFunctionTypeSorobanAuthorizedFunctionTypeContractFn && entry.RootInvocation.Function.ContractFn == nil {
+			return
+		}
+
+		got, err := Copy(entry)
+		if err != nil {
+			t.Fatalf("Copy failed on valid entry: %v", err)
+		}
+
+		wantBytes := mustMarshal(t, entry)
+		gotBytes := mustMarshal(t, got)
+		if !bytes.Equal(wantBytes, gotBytes) {
+			t.Errorf("fuzz round-trip not byte-identical:\n want %x\n  got %x", wantBytes, gotBytes)
+		}
+	})
+}
+
 func TestCopyConcurrentReuse(t *testing.T) {
 	small := sampleEntry(t)
 	large := bigEntry(t)

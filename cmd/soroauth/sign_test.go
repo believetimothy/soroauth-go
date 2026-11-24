@@ -1,16 +1,17 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/json"
-	"strings"
 	"testing"
 
+	"crypto/sha256"
+	"encoding/json"
 	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/stellar/go-stellar-sdk/xdr"
+	"strings"
 )
 
-// vectorKeypair derives a vector's deterministic test keypair from its label.
+// vectorKeypair derives a vector's public test keypair from its label; see
+// CONTRIBUTING.md#deterministic-test-keys.
 func vectorKeypair(t *testing.T, label string) *keypair.Full {
 	t.Helper()
 	kp, err := keypair.FromRawSeed(sha256.Sum256([]byte(label)))
@@ -168,7 +169,7 @@ func TestSignRejects(t *testing.T) {
 		{
 			name:    "no secret-env",
 			args:    []string{"sign", "--entry", v.UnsignedEntryXDR, "--valid-until", "1", "--network", "testnet"},
-			wantMsg: "--secret-env is required",
+			wantMsg: "exactly one of --secret-env or --assertion must be provided",
 		},
 		{
 			name: "the variable is unset",

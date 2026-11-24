@@ -1,83 +1,70 @@
-package rpcflow
+package rpcflow_test
 
 import (
-	"os"
+	"context"
+	"encoding/json"
+	"net/http"
 	"path/filepath"
 	"testing"
+
+	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
+	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/soroauth/soroauth-go/rpcflow"
+	"github.com/soroauth/soroauth-go/rpcflow/rpcfixture"
 )
 
-func TestLoadRefusesMissingDir(t *testing.T) {
-	_, err := Load(filepath.Join(t.TempDir(), "does-not-exist"))
-	if err == nil {
-		t.Fatal("Load returned nil error for a missing directory")
-	}
-}
-
-func TestLoadSkipsNonJSONFiles(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("not json"), 0o644); err != nil {
-		t.Fatalf("writing README: %v", err)
-	}
-	writeFixture(t, dir, "valid.json", `{
-		"name": "test",
-		"network_passphrase": "Test SDF Network ; September 2015",
-		"signed_entry_xdr": "AAAA",
-		"expected_outcome": "accepted"
-	}`)
-	fixtures, err := Load(dir)
+func TestSimulateRecordAgainstACommittedTestnetFixture(t *testing.T) {
+	fixture, err := rpcfixture.LoadFile(filepath.Join("rpcfixture", "testdata", "simulate_record_testnet.json"))
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatalf("loading the committed fixture: %v", err)
 	}
-	if len(fixtures) != 1 {
-		t.Fatalf("got %d fixtures, want 1", len(fixtures))
+	if fixture.Metadata.NetworkPassphrase != "Test SDF Network ; September 2015" {
+		t.Fatalf("fixture network = %q, want testnet", fixture.Metadata.NetworkPassphrase)
 	}
-	if fixtures[0].Name != "test" {
-		t.Errorf("got name %q, want %q", fixtures[0].Name, "test")
+	if fixture.Metadata.LatestLedger == 0 || fixture.Metadata.RPCVersion == "" || fixture.Metadata.ProtocolVersion <= 0 {
+		t.Fatalf("fixture metadata is incomplete: %+v", fixture.Metadata)
 	}
-}
 
-func TestLoadRejectsFixtureWithNoName(t *testing.T) {
-	dir := t.TempDir()
-	writeFixture(t, dir, "bad.json", `{
-		"name": "",
-		"network_passphrase": "Test SDF Network ; September 2015",
-		"signed_entry_xdr": "AAAA",
-		"expected_outcome": "accepted"
-	}`)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("Load returned nil error for a fixture with no name")
+	var request struct {
+		Transaction     string `json:"transaction"`
+		AuthMode        string `json:"authMode"`
+		UseUpgradedAuth bool   `json:"useUpgradedAuth"`
 	}
-}
-
-func TestLoadRejectsFixtureWithNoXDR(t *testing.T) {
-	dir := t.TempDir()
-	writeFixture(t, dir, "bad.json", `{
-		"name": "no-xdr",
-		"network_passphrase": "Test SDF Network ; September 2015",
-		"signed_entry_xdr": "",
-		"expected_outcome": "accepted"
-	}`)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("Load returned nil error for a fixture with no signed_entry_xdr")
+	if err := json.Unmarshal(fixture.Exchanges[0].Params, &request); err != nil {
+		t.Fatalf("decoding the recorded request: %v", err)
 	}
-}
+	if request.Transaction == "" || request.AuthMode != "record" {
+		t.Fatalf("recorded request is not a record-mode simulation: %+v", request)
+	}
 
-func TestLoadEmptyDir(t *testing.T) {
-	dir := t.TempDir()
-	fixtures, err := Load(dir)
+	replayer, err := rpcfixture.NewReplayer(fixture)
 	if err != nil {
-		t.Fatalf("Load of empty dir: %v", err)
+		t.Fatalf("building the replayer: %v", err)
 	}
-	if len(fixtures) != 0 {
-		t.Fatalf("got %d fixtures from empty dir, want 0", len(fixtures))
-	}
-}
+	client := rpcclient.NewClient("https://fixture.invalid", &http.Client{Transport: replayer})
 
-func writeFixture(t *testing.T, dir, name, content string) {
-	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-		t.Fatalf("writing fixture %s: %v", name, err)
+	record, err := rpcflow.SimulateRecord(context.Background(), rpcflow.RecordParams{
+		Client:          client,
+		EnvelopeXDR:     request.Transaction,
+		UseUpgradedAuth: request.UseUpgradedAuth,
+	})
+	if err != nil {
+		t.Fatalf("SimulateRecord against the fixture: %v", err)
+	}
+	if len(record.Entries) == 0 {
+		t.Fatal("the recorded simulation produced no authorization entries")
+	}
+	if got, want := record.Entries[0].Arm, "address_v2"; got != want {
+		t.Fatalf("recorded entry arm = %q, want %q", got, want)
+	}
+	if record.Entries[0].Entry.Credentials.Type != xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2 {
+		t.Fatalf("recorded credential XDR type = %v, want address V2", record.Entries[0].Entry.Credentials.Type)
+	}
+	if unused := replayer.Unused(); len(unused) != 0 {
+		t.Fatalf("fixture exchanges left unused: %v", unused)
+	}
+	if mismatches := replayer.Mismatches(); len(mismatches) != 0 {
+		t.Fatalf("fixture requests mismatched: %v", mismatches)
 	}
 }

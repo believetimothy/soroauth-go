@@ -12,16 +12,23 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/stellar/go-stellar-sdk/keypair"
+
+	"github.com/soroauth/soroauth-go"
 )
 
 const doctorUsage = `soroauth doctor — check the local environment for common first-run problems.
 
 usage:
-  soroauth doctor [--rpc-url <url>] [--secret-env <VAR>] [--timeout <duration>] [--json]
+  soroauth doctor [--config <path>] [--network <name|passphrase>] [--rpc-url <url>] \
+                  [--secret-env <VAR>] [--address <G…>] [--format text|json] [--timeout <duration>] [--json]
 
 Most first-run failures are environmental rather than something wrong with an
 entry or a key, and the error from "sign" or "payload" does not say so. This
-runs a small set of checks and reports each as pass or fail:
+reports which configuration file was loaded and which setting came from which
+precedence layer (flag, env, file, or default), then runs a small set of checks
+and reports each as pass or fail:
 
   go toolchain    the "go" binary on PATH is at least the version this module
                   requires (see go.mod), needed to build or update soroauth
@@ -30,19 +37,34 @@ runs a small set of checks and reports each as pass or fail:
                   (default: https://soroban-testnet.stellar.org). Any HTTP
                   response counts as reachable; only a transport-level
                   failure (DNS, connection refused, timeout) does not
-  secret env var  only checked when --secret-env is given: whether the named
-                  environment variable is set to a non-empty value
+  secret env var  only checked when --secret-env (or secret_env in config/env)
+                  is given: whether the named environment variable is set to a
+                  non-empty value
 
-Nothing here ever inspects or prints a secret's value, only whether it is set.
+  signer possession
+                  only checked when the secret env var is set: the signer signs
+                  a throwaway payload that cannot be a real authorization and
+                  the signature is verified against the address it claims. By
+                  default that is the seed's own address; --address names the
+                  account the signer is meant to sign for, which finds a seed
+                  configured for the wrong account before a transaction fails
+                  on-chain. A pass proves key control, not that the key is a
+                  signer of the account on-chain. cannot_check (a signer whose
+                  signature the library cannot verify offline) is a failure,
+                  never a pass.
 
-With --json, prints one JSON object: "checks" (one entry per check, each with
-"name", "pass" and an optional "detail") and an overall "ok" field. Nothing
-else is written to stdout in JSON mode.
+Nothing here ever prints a secret's value. The possession check uses the
+seed in memory to sign and reports only addresses.
+
+With --json (or --format json), prints one JSON object: "config" (which file was
+loaded and each setting's resolved value and source), "checks" (one entry per
+check, each with "name", "pass" and an optional "detail") and an overall "ok"
+field. Nothing else is written to stdout in JSON mode.
 
 exit codes:
   0  every check passed
   1  at least one check failed
-  2  usage error (invalid flags)
+  2  usage error (invalid flags or unparseable config file)
 `
 
 // goVersionFloor is the minimum toolchain version this module's go.mod
@@ -62,12 +84,20 @@ type doctorCheck struct {
 // doctorReport is the full result of a doctor run, and the shape of its JSON
 // output.
 type doctorReport struct {
-	Checks []doctorCheck `json:"checks"`
-	OK     bool          `json:"ok"`
+	Config        doctorConfigReport `json:"config"`
+	Checks        []doctorCheck      `json:"checks"`
+	OK            bool               `json:"ok"`
+	Error         string             `json:"error,omitempty"`
+	SchemaVersion int                `json:"schema_version,omitempty"`
+	Code          string             `json:"code,omitempty"`
+	Message       string             `json:"message,omitempty"`
+	Field         string             `json:"field,omitempty"`
+	ExitCode      int                `json:"exit_code,omitempty"`
 }
 
 func runDoctor(args []string, stdout, stderr io.Writer, getenv func(string) string) error {
 	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	registerVerbosityFlags(flags)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
 		fmt.Fprint(stderr, doctorUsage)
@@ -75,21 +105,60 @@ func runDoctor(args []string, stdout, stderr io.Writer, getenv func(string) stri
 		flags.PrintDefaults()
 	}
 
+	configFlag := flags.String("config", "", "path to CLI configuration file (default $SOROAUTH_CONFIG or ~/.config/soroauth/config.json)")
+	networkFlag := flags.String("network", "", "testnet, futurenet, public, or a literal network passphrase")
 	rpcURL := flags.String("rpc-url", "https://soroban-testnet.stellar.org", "URL to check network reachability against")
-	secretEnv := flags.String("secret-env", "", "name of an environment variable whose presence (not value) to check")
+	secretEnv := flags.String("secret-env", "", "name of an environment variable holding the signing seed; checked for presence and key control")
+	address := flags.String("address", "", "account (G…) the signer is meant to sign for; defaults to the seed's own address")
+	formatFlag := flags.String("format", "text", "output format: text or json")
 	timeout := flags.Duration("timeout", 5*time.Second, "timeout for the network check")
 	jsonFlag := flags.Bool("json", false, "output as JSON")
 
 	if err := flags.Parse(args); err != nil {
-		return newErrorf(ExitUsageError, "%w", err)
+		return writeJSONError(stdout, *jsonFlag, newErrorf(ExitUsageError, "%w", err))
+	}
+
+	set := visitedFlags(flags)
+	cfg, err := loadConfig(*configFlag, getenv)
+	if err != nil {
+		return writeJSONError(stdout, *jsonFlag, err)
+	}
+
+	netRes := resolveNetworkValue(set, *networkFlag, getenv, cfg)
+	rpcRes := resolveRPCURLValue(set, *rpcURL, getenv, cfg, "https://soroban-testnet.stellar.org")
+	secRes := resolveSecretEnvValue(set, *secretEnv, getenv, cfg)
+	fmtRes, err := resolveFormatValue(set, *formatFlag, *jsonFlag, getenv, cfg, "text")
+	if err != nil {
+		return writeJSONError(stdout, *jsonFlag, err)
+	}
+	if fmtRes.Value != "text" && fmtRes.Value != "json" {
+		if set["format"] {
+			return writeJSONError(stdout, *jsonFlag,
+				newErrorf(ExitUsageError, "--format for doctor must be text or json, got %q", fmtRes.Value))
+		}
+		fmtRes.Value = "text"
+	}
+	jsonMode := fmtRes.Value == "json"
+
+	cfgReport := doctorConfigReport{
+		File:      cfg.Path,
+		Loaded:    cfg.Loaded,
+		Network:   netRes,
+		RPCURL:    rpcRes,
+		SecretEnv: secRes,
+		Format:    fmtRes,
 	}
 
 	checks := []doctorCheck{
 		checkGoToolchain(),
-		checkNetwork(*rpcURL, *timeout),
+		checkNetwork(rpcRes.Value, *timeout),
 	}
-	if *secretEnv != "" {
-		checks = append(checks, checkSecretEnv(*secretEnv, getenv))
+	if secRes.Value != "" {
+		secretCheck := checkSecretEnv(secRes.Value, getenv)
+		checks = append(checks, secretCheck)
+		if secretCheck.Pass {
+			checks = append(checks, checkSignerPossession(secRes.Value, *address, getenv))
+		}
 	}
 
 	ok := true
@@ -98,9 +167,32 @@ func runDoctor(args []string, stdout, stderr io.Writer, getenv func(string) stri
 			ok = false
 		}
 	}
-	report := doctorReport{Checks: checks, OK: ok}
+	report := doctorReport{Config: cfgReport, Checks: checks, OK: ok}
 
-	if *jsonFlag {
+	if jsonMode {
+		if !ok {
+			fields := machineError(newErrorf(ExitGeneralError, "one or more doctor checks failed"))
+			fields.Code = "doctor_check_failed"
+			fields.Message = "one or more doctor checks failed"
+			for _, check := range checks {
+				if check.Pass {
+					continue
+				}
+				switch {
+				case check.Name == "network":
+					fields.Field = "--rpc-url"
+				case strings.HasPrefix(check.Name, "secret env:"):
+					fields.Field = "--secret-env"
+				}
+				break
+			}
+			report.Error = fields.Message
+			report.SchemaVersion = fields.SchemaVersion
+			report.Code = fields.Code
+			report.Message = fields.Message
+			report.Field = fields.Field
+			report.ExitCode = fields.ExitCode
+		}
 		enc := json.NewEncoder(stdout)
 		enc.SetEscapeHTML(false)
 		if err := enc.Encode(report); err != nil {
@@ -114,6 +206,16 @@ func runDoctor(args []string, stdout, stderr io.Writer, getenv func(string) stri
 		}
 		return nil
 	}
+
+	if cfgReport.Loaded {
+		fmt.Fprintf(stdout, "config file:     %s (loaded)\n", cfgReport.File)
+	} else {
+		fmt.Fprintln(stdout, "config file:     none (not loaded)")
+	}
+	fmt.Fprintf(stdout, "network:         %s (source: %s)\n", displayResolved(cfgReport.Network.Value), cfgReport.Network.Source)
+	fmt.Fprintf(stdout, "rpc-url:         %s (source: %s)\n", displayResolved(cfgReport.RPCURL.Value), cfgReport.RPCURL.Source)
+	fmt.Fprintf(stdout, "secret-env:      %s (source: %s)\n", displayResolved(cfgReport.SecretEnv.Value), cfgReport.SecretEnv.Source)
+	fmt.Fprintf(stdout, "format:          %s (source: %s)\n", displayResolved(cfgReport.Format.Value), cfgReport.Format.Source)
 
 	for _, c := range checks {
 		status := "FAIL"
@@ -132,6 +234,13 @@ func runDoctor(args []string, stdout, stderr io.Writer, getenv func(string) stri
 	}
 	fmt.Fprintln(stdout, "one or more checks failed")
 	return newErrorf(ExitGeneralError, "one or more doctor checks failed")
+}
+
+func displayResolved(val string) string {
+	if val == "" {
+		return "(unset)"
+	}
+	return val
 }
 
 // checkGoToolchain reports whether the "go" binary on PATH meets
@@ -215,7 +324,9 @@ func checkNetwork(url string, timeout time.Duration) doctorCheck {
 	if err != nil {
 		return doctorCheck{Name: name, Pass: false, Detail: fmt.Sprintf("%s: %v", url, err)}
 	}
-	defer resp.Body.Close()
+	// The response body is only drained for the connection's sake; its close
+	// error cannot change the reachability verdict.
+	defer func() { _ = resp.Body.Close() }()
 
 	return doctorCheck{Name: name, Pass: true, Detail: fmt.Sprintf("%s reachable (HTTP %d)", url, resp.StatusCode)}
 }
@@ -229,4 +340,37 @@ func checkSecretEnv(name string, getenv func(string) string) doctorCheck {
 		return doctorCheck{Name: checkName, Pass: false, Detail: fmt.Sprintf("%s is empty or unset", name)}
 	}
 	return doctorCheck{Name: checkName, Pass: true, Detail: fmt.Sprintf("%s is set", name)}
+}
+
+// checkSignerPossession runs soroauth.CheckPossession for the signer the
+// secret env var configures. It reports only addresses, never the seed, and it
+// treats cannot_check as a failure: a doctor that passed on "could not tell"
+// would hide exactly the misconfiguration it exists to find.
+func checkSignerPossession(envName, claimed string, getenv func(string) string) doctorCheck {
+	const name = "signer possession"
+
+	parsed, err := keypair.Parse(getenv(envName))
+	full, ok := parsed.(*keypair.Full)
+	if err != nil || !ok {
+		return doctorCheck{Name: name, Pass: false,
+			Detail: fmt.Sprintf("%s does not hold a valid Stellar secret seed (S…)", envName)}
+	}
+
+	signer := soroauth.NewEd25519Signer(full)
+	if claimed != "" {
+		signer = soroauth.SignerFunc(claimed, signer.Sign)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	report, err := soroauth.CheckPossession(ctx, signer)
+	if err != nil {
+		return doctorCheck{Name: name, Pass: false, Detail: fmt.Sprintf("%s: %v", signer.Address(), err)}
+	}
+	if !report.Passed() {
+		return doctorCheck{Name: name, Pass: false,
+			Detail: fmt.Sprintf("%s: %s: %s", report.Address, report.Verdict, report.Reason)}
+	}
+	return doctorCheck{Name: name, Pass: true,
+		Detail: fmt.Sprintf("%s: the signer controls this address", report.Address)}
 }

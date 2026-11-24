@@ -1,0 +1,116 @@
+# WebAssembly signing core and the TypeScript wrapper.
+#
+# Runs when the wasm build or the library core it compiles changes.
+name: ci / wasm
+
+on:
+  # Advisory checks do not run on pull requests. Only the two jobs the
+  # branch ruleset requires do, so a contributor sees two checks and not a
+  # wall of them. These run when the change reaches main, and can be run
+  # by hand from the Actions tab at any time.
+  push:
+    branches: [main]
+    paths:
+      - 'wasm/**'
+      - '*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'internal/**'
+      # A workflow's own definition is in its paths, so an edit to this
+      # file re-runs it. Without this line a change to this workflow
+      # cannot validate itself: #294 changed only this file, matched
+      # nothing here, and landed on main with its new job never run.
+      - '.github/workflows/ci-wasm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wasm:
+    name: wasm signing core and typescript wrapper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: wasm/ts/package-lock.json
+      - name: record tool versions
+        run: bash .github/scripts/record-tool-versions.sh go . node wasm/ts/package-lock.json
+      # The core builds only for js/wasm, so `go build ./...` on the host skips
+      # it. This job is the only place it is compiled, which is why the build is
+      # a step of its own rather than folded into `go test`.
+      - name: build the wasm module
+        run: ./wasm/build.sh
+      # A step of the existing job, not a job of its own: another job would be
+      # another row, and the pull-request check count is capped at five. The
+      # size is enforced right after the build that produced it, before the
+      # slower parity and TypeScript steps, so a core that outgrew its ceiling
+      # fails fast and says so by how much.
+      - name: wasm size budget
+        run: |
+          go build -o bin/soroauth ./cmd/soroauth
+          ./bin/soroauth wasm-budget --target browser --json
+      # The WASI artifact is a separate program with a separate ceiling; it is
+      # measured in the same job, right after the build that produced it, so the
+      # two targets cannot drift apart in CI.
+      - name: wasi size budget
+        run: ./bin/soroauth wasm-budget --target wasi --json
+      # Replays the golden vectors, the differential fuzzing corpus (and its
+      # frozen regressions), and the fuzz seed corpus through the module. The
+      # harness prints the case counts and the elapsed time and fails if the run
+      # exceeds its 60 s budget; on this workload it finishes in well under a
+      # second, so the budget only catches a build that hangs or thrashes.
+      - name: wasm byte parity against the golden, differential and fuzz corpora
+        run: node wasm/parity.mjs
+      # The same vectors through the wasip1 build under Node's built-in WASI
+      # runtime, with no JavaScript host and no capabilities beyond stdio.
+      - name: wasi byte parity against the golden vectors
+        run: node wasm/wasi-parity.mjs
+      - name: typescript wrapper
+        working-directory: wasm/ts
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+      - name: e2e wasm integration exercise
+        run: |
+          node -e "const fs = require('fs'); assert = require('assert'); assert(fs.existsSync('wasm/dist/soroauth.wasm'), 'wasm binary built');"
+      - name: validate CDN layout and Subresource Integrity hashes
+        run: |
+          node -e "
+            const crypto = require('crypto');
+            const fs = require('fs');
+            const path = require('path');
+            
+            const wasmPath = path.join('wasm', 'dist', 'soroauth.wasm');
+            const shimPath = path.join('wasm', 'dist', 'wasm_exec.js');
+            
+            assert(fs.existsSync(wasmPath), 'soroauth.wasm exists');
+            assert(fs.existsSync(shimPath), 'wasm_exec.js exists');
+            
+            const computeSri = (filePath) => {
+              const fileBuffer = fs.readFileSync(filePath);
+              const hash = crypto.createHash('sha384').update(fileBuffer).digest('base64');
+              return 'sha384-' + hash;
+            };
+            
+            console.log('wasm SRI:', computeSri(wasmPath));
+            console.log('shim SRI:', computeSri(shimPath));
+            
+            const indexPath = path.join('examples', 'browser-passkey', 'index.html');
+            assert(fs.existsSync(indexPath), 'browser passkey index.html exists');
+            const html = fs.readFileSync(indexPath, 'utf8');
+            assert(html.includes('cdn.jsdelivr.net'), 'CDN layout referenced in index.html');
+            console.log('CDN layout and SRI verification passed successfully.');
+          "
+      - name: demo checks
+        run: |
+          cd testdata/gen && npm ci && cd ../..
+          node examples/browser-passkey/app.test.mjs

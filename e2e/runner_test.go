@@ -89,12 +89,33 @@ type scenarioSpec struct {
 	// rewrite.
 	prepare prepareFunc
 
+	// afterSign runs after AuthorizeAll and before the enforcing simulation.
+	// It exists for a scenario whose point is a malformed submission — the
+	// mixed-arm control removes one already-produced signature — without
+	// having to copy the record/sign/enforce/submit flow.
+	afterSign func(t *testing.T, entries []xdr.SorobanAuthorizationEntry) []xdr.SorobanAuthorizationEntry
+
 	// expectFailure marks a run whose point is an on-chain refusal. The
 	// enforcing simulation is skipped — it would fail locally for the very
 	// reason under test — and the submission is sized from the recording
 	// pass with rejectionHeadroom, so the transaction reaches the real host
 	// and is refused there, after fees.
 	expectFailure bool
+
+	// headroom overrides the multiplier applied to the recording pass's
+	// instruction budget and resource fee. Zero means the default from
+	// submissionHeadroom.
+	//
+	// It exists for a refusal whose cost is not the one the default was
+	// measured against. rejectionHeadroom is sized for a contract that
+	// returns an error, where the work the recording pass missed is one
+	// __check_auth call. Scenario K's refusal happens inside the host's own
+	// secp256r1 verification, and paying for that verification is itself
+	// most of the cost: at the default multiplier the submission exhausted
+	// its instruction budget while the host was escalating the trap, and the
+	// host reported the budget failure rather than the P-256 one. The value
+	// is measured, not guessed; see e2e/README.md.
+	headroom uint32
 }
 
 // runScenario is the one runner every scenario uses: record, sign with
@@ -104,6 +125,7 @@ type scenarioSpec struct {
 // scenarioSpec, not here.
 func runScenario(t *testing.T, h *harness, spec scenarioSpec) submission {
 	t.Helper()
+	recordScenarioRun(t)
 
 	// 1. record: the host reports which addresses must authorize the call
 	// and hands back unsigned authorization entries.
@@ -124,6 +146,9 @@ func runScenario(t *testing.T, h *harness, spec scenarioSpec) submission {
 	if err != nil {
 		t.Fatalf("AuthorizeAll: %v", err)
 	}
+	if spec.afterSign != nil {
+		signedEntries = spec.afterSign(t, signedEntries)
+	}
 	logSignedEntries(t, signedEntries)
 
 	spec.op.Auth = signedEntries
@@ -137,7 +162,10 @@ func runScenario(t *testing.T, h *harness, spec scenarioSpec) submission {
 		enforceTx := h.build(t, h.account(t, spec.payer.Address()), spec.op)
 		sim = h.simulate(t, enforceTx, rpc.AuthModeEnforce, false)
 	}
-	headroom := submissionHeadroom(spec.expectFailure)
+	headroom := spec.headroom
+	if headroom == 0 {
+		headroom = submissionHeadroom(spec.expectFailure)
+	}
 
 	// 4. assemble with that pass's resources — the Go SDK has no
 	// assembleTransaction, so harness.assembleWithHeadroom attaches the

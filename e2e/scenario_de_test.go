@@ -83,7 +83,7 @@ func TestScenarioD(t *testing.T) {
 	t.Logf("tx hash:   %s", result.Hash)
 	t.Logf("ledger:    %d", result.Ledger)
 	t.Logf("arm:       %s", result.Arm)
-	t.Logf("link:      %s%s", explorerBaseURL, result.Hash)
+	t.Logf("link:      %s%s", runExplorerBase, result.Hash)
 
 	record(scenarioResult{
 		ID:        "D",
@@ -188,5 +188,79 @@ func TestScenarioE(t *testing.T) {
 			"the transaction failed, but not for the reason this scenario is about", codes, unknownDelegate)
 	} else {
 		t.Logf("contract error code %d (AccountError::UnknownDelegate) confirmed in the host diagnostics", unknownDelegate)
+	}
+}
+
+// TestScenarioPolicyWithinLimit proves the policy account authorizes a transfer
+// that is within its spending limit through soroauth and CAP-71 delegates.
+func TestScenarioPolicyWithinLimit(t *testing.T) {
+	h := newHarness(t)
+
+	payer := h.newAccount(t, "payer P")
+	d1 := h.newAccount(t, "delegate D1")
+	to := h.newAccount(t, "recipient B")
+
+	// Deploy policy account with a limit comfortably above the transfer and a
+	// period of 100 ledgers, so the single transfer is within both.
+	deployed := h.deployPolicyAccount(t, payer, []string{d1.Address()}, transferAmount*2, 100)
+	h.fundContract(t, payer, deployed.ContractAddress, transferAmount*5)
+
+	op := h.transferOp(t, scAddressOf(t, deployed.ContractAddress), scAddressOf(t, to.Address()),
+		transferAmount, payer.Address())
+	result := runScenario(t, h, scenarioSpec{
+		payer:        payer,
+		op:           op,
+		upgradedAuth: true,
+		signers: []soroauth.Signer{
+			soroauth.NewEd25519Signer(d1),
+		},
+		prepare: prepareDelegates(deployed.ContractAddress, []string{d1.Address()}),
+	})
+
+	if result.Status != rpc.TransactionStatusSuccess {
+		t.Fatalf("policy within-limit scenario failed on-chain (status %s):\n%s", result.Status, result.RawError)
+	}
+}
+
+// TestScenarioPolicyOverLimit proves the policy account refuses a transfer
+// exceeding its spending limit with PolicyAccountError::SpendingLimitExceeded.
+func TestScenarioPolicyOverLimit(t *testing.T) {
+	h := newHarness(t)
+
+	payer := h.newAccount(t, "payer P")
+	d1 := h.newAccount(t, "delegate D1")
+	to := h.newAccount(t, "recipient B")
+
+	// Deploy policy account with a low limit of 1
+	deployed := h.deployPolicyAccount(t, payer, []string{d1.Address()}, 1, 100)
+	h.fundContract(t, payer, deployed.ContractAddress, transferAmount*5)
+
+	op := h.transferOp(t, scAddressOf(t, deployed.ContractAddress), scAddressOf(t, to.Address()),
+		transferAmount, payer.Address())
+	result := runScenario(t, h, scenarioSpec{
+		payer:         payer,
+		op:            op,
+		upgradedAuth:  true,
+		expectFailure: true,
+		signers: []soroauth.Signer{
+			soroauth.NewEd25519Signer(d1),
+		},
+		prepare: prepareDelegates(deployed.ContractAddress, []string{d1.Address()}),
+	})
+
+	if result.Status == rpc.TransactionStatusSuccess {
+		t.Fatal("the host accepted an over-limit transfer; scenario policy over-limit proves nothing if this succeeds")
+	}
+
+	const spendingLimitExceeded = 3
+	codes := contractErrorCodes(t, result.Diagnostics)
+	found := false
+	for _, code := range codes {
+		if code == spendingLimitExceeded {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the host reported contract error codes %v, want %d (PolicyAccountError::SpendingLimitExceeded)", codes, spendingLimitExceeded)
 	}
 }
